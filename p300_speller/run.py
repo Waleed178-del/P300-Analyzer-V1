@@ -32,7 +32,8 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "src"))
 
-from main_pipeline import P300Pipeline, load_config  # noqa: E402
+from main_pipeline import load_config  # noqa: E402
+from session import SessionManager  # noqa: E402
 
 DEFAULT_CONFIG = os.path.join(_HERE, "configs", "config.yaml")
 
@@ -51,8 +52,8 @@ def _resolve_paths(config: dict) -> dict:
 def cmd_train(args: argparse.Namespace) -> int:
     """Run calibration and persist a trained model."""
     config = _resolve_paths(load_config(args.config))
-    pipeline = P300Pipeline(config)
-    report = pipeline.train(words=args.words, n_sequences=args.sequences)
+    session = SessionManager(config)
+    report = session.calibrate(words=args.words, n_sequences=args.sequences)
     print("[train] complete:", report)
     print(f"[train] model saved to {config['classifier']['model_path']}")
     return 0
@@ -67,8 +68,8 @@ def cmd_spell(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    pipeline = P300Pipeline(config)
-    text = pipeline.spell(
+    session = SessionManager(config)
+    text = session.free_spell(
         n_characters=args.chars,
         n_sequences=args.sequences,
         simulated_intent=args.simulate_intent,
@@ -90,14 +91,14 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     config["speller"]["inter_character_pause_s"] = 0.1
     fast_sequences = 8
 
-    pipeline = P300Pipeline(config)
+    session = SessionManager(config)
     print("[selftest] training on 'CAT' ...")
-    report = pipeline.train(words=["CAT"], n_sequences=fast_sequences)
+    report = session.calibrate(words=["CAT"], n_sequences=fast_sequences)
     print("[selftest] training:", report)
 
     intent = "CAT"
     print(f"[selftest] spelling intent {intent!r} ...")
-    text = pipeline.spell(
+    text = session.free_spell(
         n_characters=len(intent),
         n_sequences=fast_sequences,
         simulated_intent=intent,

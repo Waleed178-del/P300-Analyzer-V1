@@ -1,7 +1,7 @@
-"""feature_extraction.py — turn epochs into classifier feature vectors.
+"""features.py — turn epochs into classifier feature vectors.
 
 The classifier in :mod:`classifier` expects fixed-length, scaled numeric
-vectors. This module bridges :class:`signal_processing.Epoch` objects to that
+vectors. This module bridges :class:`processing.Epoch` objects to that
 representation through three deterministic steps:
 
 1. **Spatial filtering** (optional) — combine information across channels. The
@@ -25,7 +25,7 @@ from typing import List, Sequence
 
 import numpy as np
 
-from signal_processing import Epoch
+from processing import Epoch
 
 
 # --------------------------------------------------------------------------- #

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -39,10 +39,10 @@ from classifier import (
     TrainingReport,
     decode_character_scores,
 )
-from eeg_acquisition import BaseEEGSource, Simulator, StimulusMarker, build_source
-from feature_extraction import epochs_to_matrix
-from signal_processing import Epoch, epoch_data, precondition
-from speller_matrix import SpellerMatrix
+from acquisition import BaseEEGSource, Simulator, StimulusMarker, build_source
+from features import epochs_to_matrix
+from processing import Epoch, epoch_data, precondition
+from stimulus import SpellerMatrix
 
 
 def load_config(path: str) -> dict:
@@ -77,7 +77,7 @@ class P300Pipeline:
         config: Parsed configuration document.
         source: Optional pre-built EEG source (mainly for tests). If ``None`` a
             source is constructed from ``config`` via
-            :func:`eeg_acquisition.build_source`.
+            :func:`acquisition.build_source`.
     """
 
     def __init__(self, config: dict, source: Optional[BaseEEGSource] = None) -> None:
@@ -90,6 +90,43 @@ class P300Pipeline:
 
         self.source: BaseEEGSource = source if source is not None else build_source(config)
         self.speller = SpellerMatrix(config)
+
+        # Optional observer invoked with ``(event_type, data_dict)`` at every
+        # significant lifecycle point (see :meth:`_emit`). The session manager
+        # registers one to drive user prompts and persistent logging. When no
+        # listener is attached the pipeline prints a concise default line so the
+        # bare CLI / self-test remains informative.
+        self.event_listener: Optional[Callable[[str, Dict[str, object]], None]] = None
+
+    # ------------------------------------------------------------------ #
+    # Event emission
+    # ------------------------------------------------------------------ #
+    def _emit(self, event_type: str, **data: object) -> None:
+        """Dispatch a lifecycle event to the listener (or a default printer).
+
+        Args:
+            event_type: One of ``calibration_start``, ``character_cue``,
+                ``character_trained``, ``calibration_complete``, ``spell_start``,
+                ``character_decoded``, ``spell_complete``.
+            **data: Event-specific payload forwarded verbatim to the listener.
+        """
+        if self.event_listener is not None:
+            self.event_listener(event_type, data)
+        else:
+            self._default_report(event_type, data)
+
+    @staticmethod
+    def _default_report(event_type: str, data: Dict[str, object]) -> None:
+        """Concise stdout fallback when no listener is registered."""
+        if event_type == "character_decoded":
+            result = data["result"]  # type: ignore[index]
+            text = data["text"]  # type: ignore[index]
+            print(
+                f"[spell] selected '{result.symbol}' "  # type: ignore[attr-defined]
+                f"(row={result.row}, col={result.col}) -> \"{text}\""  # type: ignore[attr-defined]
+            )
+        elif event_type == "calibration_complete":
+            print(f"[train] calibration complete: {data['report']}")
 
     # ------------------------------------------------------------------ #
     # Shared data path
@@ -168,15 +205,23 @@ class P300Pipeline:
         try:
             # Allow the acquisition buffer to prime before the first flash.
             time.sleep(1.0)
+            self._emit("calibration_start", words=list(words))
             for word in words:
                 for symbol in word.upper():
                     if symbol not in self.speller.symbol_to_rc:
                         # Skip characters not present in the matrix (e.g. space).
                         continue
+                    self._emit("character_cue", symbol=symbol, word=word)
                     Xc, yc = self._train_one_character(symbol, n_sequences)
                     if Xc.size:
                         X_parts.append(Xc)
                         y_parts.append(yc)
+                        self._emit(
+                            "character_trained",
+                            symbol=symbol,
+                            epochs=int(Xc.shape[0]),
+                            targets=int((yc == TARGET).sum()),
+                        )
                     self._inter_character_pause()
         finally:
             self.speller.close()
@@ -196,6 +241,11 @@ class P300Pipeline:
         )
         report = classifier.fit(X, y)
         classifier.save(self.clf_cfg["model_path"])
+        self._emit(
+            "calibration_complete",
+            report=report,
+            model_path=self.clf_cfg["model_path"],
+        )
         return report
 
     def _train_one_character(
@@ -259,6 +309,7 @@ class P300Pipeline:
         self.speller.open()
         try:
             time.sleep(1.0)
+            self._emit("spell_start")
             idx = 0
             while True:
                 if n_characters is not None and idx >= n_characters:
@@ -283,6 +334,7 @@ class P300Pipeline:
 
         text = "".join(decoded)
         self._write_output(text)
+        self._emit("spell_complete", text=text)
         return text
 
     @staticmethod
@@ -342,15 +394,14 @@ class P300Pipeline:
             time.sleep(pause)
 
     def _announce_selection(self, result: CharacterResult, decoded: List[str]) -> None:
-        """Flash the decoded symbol as a cue and print progress."""
+        """Flash the decoded symbol as visual feedback and emit a decode event."""
         try:
             self.speller.show_cue(result.symbol, duration_s=1.0)
         except Exception:
+            # Visual feedback is best-effort; never let a render glitch abort
+            # an in-progress spelling session.
             pass
-        print(
-            f"[spell] selected '{result.symbol}' "
-            f"(row={result.row}, col={result.col}) -> \"{''.join(decoded)}\""
-        )
+        self._emit("character_decoded", result=result, text="".join(decoded))
 
     def _write_output(self, text: str) -> None:
         import os

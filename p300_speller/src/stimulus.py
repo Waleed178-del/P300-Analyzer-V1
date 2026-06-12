@@ -1,4 +1,4 @@
-"""speller_matrix.py — the visual 6x6 Row/Column stimulus presenter.
+"""stimulus.py — the visual 6x6 Row/Column stimulus presenter.
 
 Implements the Farwell & Donchin (1988) Row-Column paradigm with :mod:`pygame`.
 A grid of symbols is drawn dim; to elicit P300s an entire random row or entire
@@ -13,7 +13,7 @@ Responsibilities:
   exactly once, in a randomised order that never repeats the same stimulus
   back-to-back.
 * Timestamp each flash with :func:`time.perf_counter` at the instant the
-  intensified frame is presented, and push a :class:`~eeg_acquisition.Stimulus\
+  intensified frame is presented, and push a :class:`~acquisition.Stimulus\
 Marker` to the EEG source so the neural epoch can be aligned to it.
 * Support a *headless* mode (SDL dummy video driver) so the full timing
   pipeline runs on a server / CI without a physical display.
@@ -31,7 +31,7 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from eeg_acquisition import BaseEEGSource, StimulusMarker
+from acquisition import BaseEEGSource, StimulusMarker
 
 
 def _precise_sleep(duration_s: float) -> None:
