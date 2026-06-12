@@ -1,0 +1,9 @@
+# Runtime dependencies for the P300 Speller.
+# Install with:  pip install -r requirements.txt
+numpy>=1.23
+scipy>=1.9
+scikit-learn>=1.2
+joblib>=1.2
+pyyaml>=6.0
+pygame>=2.1
+pyserial>=3.5
