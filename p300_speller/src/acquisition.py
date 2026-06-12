@@ -1,4 +1,4 @@
-"""eeg_acquisition.py — EEG data sources for the P300 Speller.
+"""acquisition.py — EEG data sources for the P300 Speller.
 
 This module abstracts *where* EEG samples come from behind a single interface,
 :class:`BaseEEGSource`, so the rest of the pipeline never needs to know whether

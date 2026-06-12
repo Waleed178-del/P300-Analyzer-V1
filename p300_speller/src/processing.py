@@ -1,7 +1,7 @@
-"""signal_processing.py — filtering and epoching for the P300 Speller.
+"""processing.py — filtering and epoching for the P300 Speller.
 
 This module turns the raw, continuous, timestamped EEG stream produced by
-:mod:`eeg_acquisition` into clean, baseline-corrected epochs aligned to stimulus
+:mod:`acquisition` into clean, baseline-corrected epochs aligned to stimulus
 flashes. It contains two responsibilities:
 
 1. **Spectral conditioning** — a zero-phase Butterworth band-pass plus an IIR
@@ -26,7 +26,7 @@ from typing import List, Sequence, Tuple
 import numpy as np
 from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
 
-from eeg_acquisition import StimulusMarker
+from acquisition import StimulusMarker
 
 
 # --------------------------------------------------------------------------- #
