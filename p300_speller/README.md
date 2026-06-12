@@ -18,18 +18,27 @@ p300_speller/
 ├── arduino/
 │   └── p300_eeg_acquisition.ino # ADS1115 firmware: timestamped packets + sync markers
 ├── src/
-│   ├── eeg_acquisition.py        # Serial reader + synthetic Simulator (shared interface)
-│   ├── signal_processing.py      # Butterworth band-pass, notch, epoching, baseline
-│   ├── feature_extraction.py     # spatial filter, downsample, flatten
+│   ├── acquisition.py            # Serial reader + synthetic Simulator (shared interface)
+│   ├── processing.py             # Butterworth band-pass, notch, epoching, baseline
+│   ├── features.py               # spatial filter, downsample, flatten
 │   ├── classifier.py             # StandardScaler + LDA/LinearSVC, save/load, decoding
-│   ├── speller_matrix.py         # pygame 6x6 grid, row/column flashing, perf_counter markers
-│   └── main_pipeline.py          # train / spell orchestration
-└── run.py                        # CLI entry point
+│   ├── stimulus.py               # pygame 6x6 grid, row/column flashing, perf_counter markers
+│   ├── session.py                # session manager: phases, prompts, logging
+│   └── main_pipeline.py          # train / spell orchestration + event hooks
+├── tests/
+│   ├── test_processing.py        # filtering + epoching unit tests
+│   └── test_features.py          # spatial filter / downsample / flatten unit tests
+├── run.py                        # CLI entry point
+└── requirements.txt
 ```
 
 **Signal path (identical for train and spell):**
 `acquire → band-pass + notch → epoch (-100..800 ms) + baseline → downsample →
 flatten → StandardScaler → LDA → average scores per row/col → argmax intersection`.
+
+**Control layers.** `main_pipeline.P300Pipeline` owns the signal flow and emits
+lifecycle events; `session.SessionManager` sits above it to drive operator
+prompts, character cycling, and persistent logging (to `output/session_*.log`).
 
 ## Hardware
 
@@ -67,6 +76,15 @@ python run.py spell --simulate-intent CAT --chars 3
 Set `acquisition.use_simulator: false` in `config.yaml` to use the real
 Arduino, and `acquisition.serial.port` to your device's port.
 
+## Tests
+
+```bash
+pytest -q            # run the processing + feature-extraction unit tests
+```
+
+The headless `selftest` is the integration check: it calibrates and then spells
+on the Simulator, asserting the decoded text matches the intended word.
+
 ## Key parameters (`config.yaml`)
 
 | Parameter | Meaning |
@@ -76,6 +94,7 @@ Arduino, and `acquisition.serial.port` to your device's port.
 | `processing.notch.freq_hz` | mains hum (50 EU / 60 NA) |
 | `processing.epoch` | window (−100..800 ms) + baseline |
 | `features.downsample_hz` | epoch decimation (20 Hz) |
+| `features.spatial_filter` | `none` (default, 1–3 ch) or `car` (dense montage) |
 | `classifier.model_type` | `lda` (default) or `svm` |
 | `speller.n_sequences` | flash repetitions per character (more = slower, more accurate) |
 | `speller.flash_duration_ms` / `inter_stimulus_interval_ms` | stimulus timing |

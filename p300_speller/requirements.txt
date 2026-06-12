@@ -7,3 +7,11 @@ joblib>=1.2
 pyyaml>=6.0
 pygame>=2.1
 pyserial>=3.5
+
+# Optional: only needed if you drive the ADS1115 from a Blinka-capable host
+# (e.g. Raspberry Pi) instead of the bundled Arduino firmware. The reference
+# build streams from the Arduino over serial and does not import this at runtime.
+adafruit-circuitpython-ads1x15>=2.2
+
+# Test tooling.
+pytest>=7.0
