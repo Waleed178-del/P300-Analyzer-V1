@@ -33,7 +33,7 @@ p300_speller/
 ```
 
 **Signal path (identical for train and spell):**
-`acquire → band-pass + notch → epoch (-100..800 ms) + baseline → downsample →
+`acquire → band-pass + notch → epoch (-100..800 ms) + baseline → downsample (20.83 Hz) →
 flatten → StandardScaler → LDA → average scores per row/col → argmax intersection`.
 
 **Control layers.** `main_pipeline.P300Pipeline` owns the signal flow and emits
@@ -61,16 +61,16 @@ pip install -r requirements.txt
 
 ```bash
 # Headless end-to-end smoke test on the synthetic Simulator (no hardware/display)
-python run.py selftest
+python p300_speller/run.py selftest
 
 # Calibrate on known words, fitting and saving a model
-python run.py train
+python p300_speller/run.py train
 
 # Free-text spelling with the trained model
-python run.py spell
+python p300_speller/run.py spell
 
 # Offline simulator demo of free spelling against a known intent
-python run.py spell --simulate-intent CAT --chars 3
+python p300_speller/run.py spell --simulate-intent CAT --chars 3
 ```
 
 Set `acquisition.use_simulator: false` in `config.yaml` to use the real
@@ -93,7 +93,7 @@ on the Simulator, asserting the decoded text matches the intended word.
 | `processing.bandpass` | 0.5–30 Hz Butterworth (zero-phase) |
 | `processing.notch.freq_hz` | mains hum (50 EU / 60 NA) |
 | `processing.epoch` | window (−100..800 ms) + baseline |
-| `features.downsample_hz` | epoch decimation (20 Hz) |
+| `features.downsample_hz` | epoch decimation (20.83 Hz = 250 / 12, integer-factor block averaging) |
 | `features.spatial_filter` | `none` (default, 1–3 ch) or `car` (dense montage) |
 | `classifier.model_type` | `lda` (default) or `svm` |
 | `speller.n_sequences` | flash repetitions per character (more = slower, more accurate) |

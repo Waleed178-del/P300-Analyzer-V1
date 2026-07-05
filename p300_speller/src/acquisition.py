@@ -266,7 +266,12 @@ class SerialAcquisition(BaseEEGSource):
         # D, seq, micros, marker, ch0[, ch1, ch2]
         expected = 4 + self.n_channels
         if len(parts) != expected:
-            return None
+            received_channels = len(parts) - 4
+            raise ValueError(
+                "Hardware payload channel-count mismatch: config.yaml "
+                f"acquisition.channels defines {self.n_channels} channel(s) "
+                f"but the incoming packet carried {received_channels}."
+            )
         try:
             counts = np.array(
                 [int(parts[4 + c]) for c in range(self.n_channels)],
