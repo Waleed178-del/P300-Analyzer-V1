@@ -82,7 +82,7 @@ processing:
 features:
   # Decimate each epoch to this rate before flattening. 250 Hz over an 0.9 s
   # window per channel is large and noisy; 20 Hz keeps the P300 morphology.
-  downsample_hz: 20
+  downsample_hz: 20.83
 
   # Spatial filter applied across channels before flattening.
   #   "none" -> raw channels; LDA learns its own spatial weighting from the

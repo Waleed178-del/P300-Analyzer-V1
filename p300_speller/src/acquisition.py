@@ -266,7 +266,9 @@ class SerialAcquisition(BaseEEGSource):
         # D, seq, micros, marker, ch0[, ch1, ch2]
         expected = 4 + self.n_channels
         if len(parts) != expected:
-            return None
+            raise ValueError(
+                f"Hardware payload mismatch: Expected {expected} channels, received {len(parts)}."
+            )
         try:
             counts = np.array(
                 [int(parts[4 + c]) for c in range(self.n_channels)],

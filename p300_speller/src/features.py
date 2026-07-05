@@ -141,7 +141,7 @@ def epochs_to_matrix(
         return np.empty((0, 0), dtype=np.float64)
 
     downsample_hz = feat_cfg.get("downsample_hz", 20)
-    spatial_filter = feat_cfg.get("spatial_filter", "car")
+    spatial_filter = feat_cfg.get("spatial_filter", "none")
 
     vectors: List[np.ndarray] = [
         epoch_to_features(ep, fs, downsample_hz, spatial_filter) for ep in epochs

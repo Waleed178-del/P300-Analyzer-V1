@@ -64,7 +64,7 @@ pip install -r requirements.txt
 python run.py selftest
 
 # Calibrate on known words, fitting and saving a model
-python run.py train
+python p300_speller/run.py train
 
 # Free-text spelling with the trained model
 python run.py spell
