@@ -14,9 +14,11 @@ needs:
   per row and per column across repetitions, and the intersection of the
   best-scoring row and column yields the selected symbol.
 
-The same data path (acquire -> precondition -> epoch -> vectorise) is shared by
-both modes via :meth:`P300Pipeline._collect_epochs`, guaranteeing train/test
-consistency.
+The same data path (acquire -> precondition -> epoch -> reject -> vectorise) is
+shared by both modes via :meth:`P300Pipeline._collect_epochs`, guaranteeing
+train/test consistency. Artifact rejection sits *inside* that shared path, so
+the criterion described in the methodology is the criterion the system actually
+applies, in both calibration and free spelling.
 
 Timing model: the speller and the EEG source share ``time.perf_counter``; the
 pipeline simply pulls the continuous buffer after each character and epochs it
@@ -25,6 +27,8 @@ against the flash markers that were recorded during presentation.
 
 from __future__ import annotations
 
+import json
+import socket
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -33,6 +37,7 @@ import numpy as np
 import yaml
 
 from classifier import (
+    DEFAULT_LEAKAGE_GATE_AUC,
     NON_TARGET,
     TARGET,
     P300Classifier,
@@ -41,7 +46,13 @@ from classifier import (
 )
 from acquisition import BaseEEGSource, Simulator, StimulusMarker, build_source
 from features import epochs_to_matrix
-from processing import Epoch, epoch_data, precondition
+from processing import (
+    Epoch,
+    RejectionReport,
+    epoch_data,
+    precondition,
+    reject_artifacts_from_config,
+)
 from stimulus import SpellerMatrix
 
 
@@ -49,6 +60,118 @@ def load_config(path: str) -> dict:
     """Load and return the YAML configuration document as a dict."""
     with open(path, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+class MonitorPublisher:
+    """Best-effort UDP publisher feeding the standalone operator monitor.
+
+    The operator display (:mod:`monitor`) must run in its own process: only one
+    process may hold the serial port, and redrawing a scrolling trace must never
+    compete with the pygame stimulus loop or the serial reader thread for the
+    GIL. The two are therefore decoupled by a datagram socket on loopback — the
+    pipeline pushes, the monitor listens, and neither blocks the other.
+
+    Every operation is deliberately failure-tolerant: a monitor that is not
+    running, a full socket buffer, or an oversized frame must never disturb an
+    in-progress recording. Publishing is fire-and-forget by construction (UDP),
+    so no acknowledgement is awaited.
+
+    Args:
+        host: Destination address (loopback by default).
+        port: Destination UDP port.
+        enabled: When ``False`` every method is a no-op.
+        max_samples: Newest-N samples included per data frame, bounding the
+            datagram well below the 65507-byte UDP payload limit.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 9750,
+        enabled: bool = False,
+        max_samples: int = 500,
+    ) -> None:
+        self.host = host
+        self.port = int(port)
+        self.enabled = bool(enabled)
+        self.max_samples = int(max_samples)
+        self._sock: Optional[socket.socket] = None
+        if self.enabled:
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock.setblocking(False)
+            except Exception:
+                self._sock = None
+                self.enabled = False
+
+    def _send(self, payload: dict) -> None:
+        """Serialise and emit one datagram, swallowing every transport error."""
+        if not self.enabled or self._sock is None:
+            return
+        try:
+            self._sock.sendto(
+                json.dumps(payload).encode("utf-8"), (self.host, self.port)
+            )
+        except Exception:
+            # BlockingIOError (full buffer), ENETUNREACH, oversized frame — all
+            # are non-events for the recording. Never propagate.
+            pass
+
+    def publish_signal(
+        self,
+        timestamps: np.ndarray,
+        data: np.ndarray,
+        fs: float,
+        channel_names: List[str],
+    ) -> None:
+        """Publish the newest slice of the continuous buffer for display."""
+        if not self.enabled or data.shape[0] == 0:
+            return
+        n = min(self.max_samples, data.shape[0])
+        self._send(
+            {
+                "type": "signal",
+                "fs": float(fs),
+                "channels": list(channel_names),
+                "t0": float(timestamps[-n]),
+                # Rounded to 3 dp: display precision, not analysis precision.
+                "data": np.round(data[-n:, :], 3).tolist(),
+            }
+        )
+
+    def publish_quality(self, report: RejectionReport) -> None:
+        """Publish the artifact-rejection state of the last epoch batch."""
+        if not self.enabled:
+            return
+        self._send(
+            {
+                "type": "quality",
+                "n_total": report.n_total,
+                "n_kept": report.n_kept,
+                "n_rejected": report.n_rejected,
+                "rejection_rate": report.rejection_rate,
+                "threshold_uv": report.threshold_uv,
+                "session_valid": report.session_valid,
+                "max_ptp_uv": (
+                    float(np.max(report.peak_to_peak_uv))
+                    if report.peak_to_peak_uv.size
+                    else 0.0
+                ),
+            }
+        )
+
+    def publish_event(self, event_type: str, text: str = "") -> None:
+        """Publish a short lifecycle annotation (cue, selection, phase change)."""
+        self._send({"type": "event", "event": event_type, "text": text})
+
+    def close(self) -> None:
+        """Release the socket. Safe to call repeatedly."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            finally:
+                self._sock = None
+        self.enabled = False
 
 
 @dataclass
@@ -91,6 +214,22 @@ class P300Pipeline:
         self.source: BaseEEGSource = source if source is not None else build_source(config)
         self.speller = SpellerMatrix(config)
 
+        # Operator monitor feed. Opt-in via the `monitor` config section; when
+        # absent or disabled every publish call is a no-op.
+        mon_cfg = config.get("monitor") or {}
+        self.monitor = MonitorPublisher(
+            host=mon_cfg.get("host", "127.0.0.1"),
+            port=mon_cfg.get("port", 9750),
+            enabled=bool(mon_cfg.get("enabled", False)),
+            max_samples=int(mon_cfg.get("max_samples", 500)),
+        )
+
+        # Cumulative artifact-rejection tally for the whole session, so the
+        # >30% session-invalidity alarm is evaluated over the session rather
+        # than per character.
+        self.session_epochs_seen = 0
+        self.session_epochs_rejected = 0
+
         # Optional observer invoked with ``(event_type, data_dict)`` at every
         # significant lifecycle point (see :meth:`_emit`). The session manager
         # registers one to drive user prompts and persistent logging. When no
@@ -110,6 +249,10 @@ class P300Pipeline:
                 ``character_decoded``, ``spell_complete``.
             **data: Event-specific payload forwarded verbatim to the listener.
         """
+        # Mirror the annotation to the operator monitor (no-op when disabled).
+        self.monitor.publish_event(
+            event_type, str(data.get("symbol", data.get("text", "")))
+        )
         if self.event_listener is not None:
             self.event_listener(event_type, data)
         else:
@@ -127,6 +270,16 @@ class P300Pipeline:
             )
         elif event_type == "calibration_complete":
             print(f"[train] calibration complete: {data['report']}")
+        elif event_type == "epochs_rejected":
+            print(f"[quality] {data['report']}")
+        elif event_type == "session_invalid":
+            print(
+                f"[quality] *** SESSION INVALID *** rejection rate "
+                f"{float(data['rejection_rate']):.1%} exceeds the "
+                f"{float(data['max_session_rate']):.0%} limit "
+                f"({data['n_rejected']}/{data['n_total']} epochs). "
+                "Repeat the recording; do not report results from this session."
+            )
 
     # ------------------------------------------------------------------ #
     # Shared data path
@@ -135,20 +288,36 @@ class P300Pipeline:
         """Seconds to wait after the last flash so its epoch is fully buffered."""
         return float(self.epoch_cfg["tmax_s"]) + 0.2
 
-    def _collect_epochs(self, markers: List[StimulusMarker]) -> List[Epoch]:
-        """Acquire, precondition, and epoch the buffer around ``markers``.
+    def _collect_epochs(
+        self, markers: List[StimulusMarker]
+    ) -> Tuple[List[Epoch], RejectionReport]:
+        """Acquire, precondition, epoch, and artifact-screen around ``markers``.
+
+        Artifact rejection is applied here, in the one path shared by
+        calibration and free spelling, so a contaminated epoch can never reach
+        the classifier through either route.
 
         Args:
             markers: The flash markers recorded for the current character.
 
         Returns:
-            Baseline-corrected epochs aligned to each usable marker.
+            ``(epochs, rejection_report)`` where ``epochs`` are the
+            baseline-corrected epochs that survived the peak-to-peak criterion.
         """
         timestamps, data = self.source.get_buffer()
         if timestamps.size == 0:
-            return []
+            return [], reject_artifacts_from_config([], self.proc_cfg)[1]
+
+        # The monitor receives the RAW buffer, not the conditioned one: the
+        # display applies its own causal filter, and keeping the two paths
+        # independent is what allows the claim that no reported result depends
+        # on the display filter.
+        self.monitor.publish_signal(
+            timestamps, data, self.fs, self.source.channel_names
+        )
         conditioned = precondition(data, self.fs, self.proc_cfg)
-        return epoch_data(
+
+        epochs = epoch_data(
             timestamps=timestamps,
             data=conditioned,
             markers=markers,
@@ -160,6 +329,46 @@ class P300Pipeline:
                 self.epoch_cfg["baseline_tmax_s"],
             ),
         )
+
+        kept, report = reject_artifacts_from_config(epochs, self.proc_cfg)
+        self.session_epochs_seen += report.n_total
+        self.session_epochs_rejected += report.n_rejected
+        self.monitor.publish_quality(report)
+        if report.n_rejected:
+            self._emit("epochs_rejected", report=report)
+        return kept, report
+
+    # ------------------------------------------------------------------ #
+    # Session-level data-quality gate
+    # ------------------------------------------------------------------ #
+    def session_rejection_rate(self) -> float:
+        """Fraction of all epochs rejected so far this session (0.0 if none)."""
+        if self.session_epochs_seen == 0:
+            return 0.0
+        return self.session_epochs_rejected / float(self.session_epochs_seen)
+
+    def _max_session_rejection_rate(self) -> float:
+        ar = self.proc_cfg.get("artifact_rejection") or {}
+        return float(ar.get("max_session_rate", 0.30))
+
+    def _check_session_quality(self) -> bool:
+        """Emit the session-invalidity alarm when too much data was rejected.
+
+        Returns:
+            ``True`` if the session is within the configured rejection budget.
+        """
+        rate = self.session_rejection_rate()
+        limit = self._max_session_rejection_rate()
+        valid = rate <= limit
+        if not valid:
+            self._emit(
+                "session_invalid",
+                rejection_rate=rate,
+                max_session_rate=limit,
+                n_total=self.session_epochs_seen,
+                n_rejected=self.session_epochs_rejected,
+            )
+        return valid
 
     def _set_simulator_target(self, symbol: Optional[str]) -> None:
         """If running on the Simulator, steer its synthetic attention.
@@ -199,6 +408,12 @@ class P300Pipeline:
         words = words if words is not None else self.config["session"]["calibration_words"]
         X_parts: List[np.ndarray] = []
         y_parts: List[np.ndarray] = []
+        group_parts: List[np.ndarray] = []
+        # One group per cued character block. Every epoch collected while the
+        # user attends a single letter shares drift, impedance, and attentional
+        # state, so the block — not the epoch — is the independent unit that
+        # cross-validation must split on.
+        block_index = 0
 
         self.source.start()
         self.speller.open()
@@ -216,6 +431,10 @@ class P300Pipeline:
                     if Xc.size:
                         X_parts.append(Xc)
                         y_parts.append(yc)
+                        group_parts.append(
+                            np.full(Xc.shape[0], block_index, dtype=int)
+                        )
+                        block_index += 1
                         self._emit(
                             "character_trained",
                             symbol=symbol,
@@ -232,6 +451,10 @@ class P300Pipeline:
 
         X = np.vstack(X_parts)
         y = np.concatenate(y_parts)
+        groups = np.concatenate(group_parts)
+
+        # Data-quality gate before any model is fit or saved.
+        self._check_session_quality()
 
         classifier = P300Classifier(
             model_type=self.clf_cfg.get("model_type", "lda"),
@@ -239,12 +462,21 @@ class P300Pipeline:
             svm_c=self.clf_cfg.get("svm_c", 0.1),
             class_weight=self.clf_cfg.get("class_weight", "balanced"),
         )
-        report = classifier.fit(X, y)
+        report = classifier.fit(
+            X,
+            y,
+            groups=groups,
+            cv_folds=int(self.clf_cfg.get("cv_folds", 5)),
+            leakage_gate_auc=float(
+                self.clf_cfg.get("leakage_gate_auc", DEFAULT_LEAKAGE_GATE_AUC)
+            ),
+        )
         classifier.save(self.clf_cfg["model_path"])
         self._emit(
             "calibration_complete",
             report=report,
             model_path=self.clf_cfg["model_path"],
+            rejection_rate=self.session_rejection_rate(),
         )
         return report
 
@@ -261,7 +493,7 @@ class P300Pipeline:
         markers = self.speller.run_character_flashes(self.source, n_sequences)
         time.sleep(self._post_roll_s())
 
-        epochs = self._collect_epochs(markers)
+        epochs, _rejection = self._collect_epochs(markers)
         if not epochs:
             return np.empty((0, 0)), np.empty((0,))
 
@@ -352,7 +584,7 @@ class P300Pipeline:
         markers = self.speller.run_character_flashes(self.source, n_sequences)
         time.sleep(self._post_roll_s())
 
-        epochs = self._collect_epochs(markers)
+        epochs, _rejection = self._collect_epochs(markers)
         if not epochs:
             return None
 

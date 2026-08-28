@@ -36,6 +36,23 @@ acquisition:
   adc_fullscale_v: 4.096
   adc_resolution_bits: 16
 
+  # Total analogue voltage gain of the head-stage AHEAD of the ADC, as a pure
+  # ratio. The counts->microvolts conversion MUST divide by this value: the
+  # ADC sees the amplified signal, not the scalp signal.
+  #
+  #   INA118P first stage : 23.73  (RG = 2.2 kOhm)
+  #   TL072 second stage  : 40
+  #   Total               : 949
+  #
+  # Without this divisor every "microvolt" the pipeline reports is 949x too
+  # large, which also makes the 100 uV artifact criterion arithmetically
+  # inoperative (a genuine 5 uV P300 would be reported as ~4745 uV).
+  #
+  # WARNING: 949 is the DESIGNED gain from the component values. It has not
+  # been measured on the bench. Replace it with the measured per-channel gain
+  # before quoting any absolute amplitude.
+  amplifier_gain: 949.0
+
   # Size of the rolling acquisition ring buffer, in seconds. Must comfortably
   # exceed (n_sequences * 12 * (flash + isi)) + epoch_tmax for one character.
   ring_buffer_s: 30.0
@@ -76,12 +93,35 @@ processing:
     baseline_tmin_s: -0.1     # baseline window start
     baseline_tmax_s: 0.0      # baseline window end (stimulus onset)
 
+  # Artifact rejection. The criterion is PEAK-TO-PEAK amplitude within the
+  # epoch, evaluated per channel; an epoch is discarded if ANY channel exceeds
+  # the threshold. This is deliberately not an absolute-deviation bound: a slow
+  # 90 uV drift ramp passes a +/-75 uV deviation test and fails a peak-to-peak
+  # test, and it is exactly that drift which must be removed.
+  artifact_rejection:
+    threshold_uv: 100.0       # locked criterion (Luck 2014, ocular/EMG range)
+    max_session_rate: 0.30    # >30% rejected -> session invalid, repeat it
+
 # -----------------------------------------------------------------------------
 # Feature extraction
 # -----------------------------------------------------------------------------
 features:
   # Decimate each epoch to this rate before flattening. 250 Hz over an 0.9 s
-  # window per channel is large and noisy; 20 Hz keeps the P300 morphology.
+  # window per channel is large and noisy; ~20 Hz keeps the P300 morphology.
+  #
+  # REALISED ARITHMETIC — quote these numbers, not the nominal ones:
+  #   decimation factor  = round(250 / 20.83)      = 12   (integer factor)
+  #   effective rate     = 250 / 12                = 20.83 Hz  (NOT 20.0 Hz)
+  #   samples per epoch  = round(0.9 s * 250 Hz)   = 225
+  #   usable samples     = (225 // 12) * 12        = 216
+  #   retained timepoints= 216 / 12                = 18
+  #   feature vector     = 18 timepoints * 3 ch    = 54 elements
+  #
+  # TAIL TRUNCATION: 225 - 216 = 9 samples = 36 ms are discarded from the end
+  # of every epoch, because block averaging needs a whole number of blocks. The
+  # epoch is configured to +800 ms but the feature vector therefore only spans
+  # to +764 ms. This is a real, deliberate limit of integer-factor decimation
+  # and must be stated wherever the epoch window is described.
   downsample_hz: 20.83
 
   # Spatial filter applied across channels before flattening.
@@ -104,6 +144,19 @@ classifier:
   svm_c: 0.1                  # regularisation strength for LinearSVC
   class_weight: "balanced"    # compensate the 5:1 non-target/target imbalance
   model_path: "models/p300_model.joblib"
+
+  # Cross-validation policy. "grouped" uses GroupKFold with one group per cued
+  # character block, so the twelve flashes of a block never straddle the
+  # train/test boundary. A shuffled StratifiedKFold estimate is always computed
+  # alongside it, but purely as a control: the difference is reported as
+  # optimism and the shuffled number is never a result.
+  cv_strategy: "grouped"
+  cv_folds: 5
+
+  # Grouped AUC above this value on a 3-channel montage is not skill. Realistic
+  # single-trial performance is 0.65-0.85; anything above the gate is treated
+  # as a leakage defect to be investigated, not a finding to be reported.
+  leakage_gate_auc: 0.95
 
 # -----------------------------------------------------------------------------
 # Speller matrix / stimulus presentation
@@ -143,6 +196,23 @@ speller:
   # Run pygame with the dummy video driver (no physical window). Enables the
   # full timing pipeline to run headless in CI / on a server for offline tests.
   headless: false
+
+# -----------------------------------------------------------------------------
+# Operator monitor (optional live display, separate process)
+# -----------------------------------------------------------------------------
+# When enabled the pipeline publishes its RAW buffer and artifact-rejection
+# state as UDP datagrams on loopback; `src/monitor.py` listens and renders them.
+# The display applies its own CAUSAL filter (sosfilt with carried state), which
+# is deliberately not the zero-phase filter used for analysis. No reported
+# result is attributable to the display filter.
+#
+# Publishing is fire-and-forget: with no monitor running, datagrams are simply
+# discarded and the recording is unaffected.
+monitor:
+  enabled: false
+  host: "127.0.0.1"
+  port: 9750
+  max_samples: 500            # newest-N samples per frame (bounds datagram size)
 
 # -----------------------------------------------------------------------------
 # Session / operation
