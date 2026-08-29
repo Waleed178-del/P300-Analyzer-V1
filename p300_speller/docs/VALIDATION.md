@@ -132,6 +132,7 @@ Two filters exist deliberately:
 | Function | `sosfiltfilt` / `filtfilt` | `sosfilt` with carried `zi` |
 | Causality | Non-causal (forward + backward) | Causal |
 | Group delay | **Identically zero** at every frequency | Non-zero, frequency-dependent |
+| Chain | Butterworth order 4 band-pass, then notch | Order-2 band-pass + notch, one SOS stack |
 | Used for results | Yes | **Never** |
 
 Forward–backward filtering conjugates the phase response, so the net phase is
@@ -149,15 +150,33 @@ never writes to the model, the epoch store, or the result files.
 
 ## 6. Operator monitor
 
-Enabled via `monitor.enabled: true` in `config.yaml`. The pipeline publishes
-fire-and-forget UDP datagrams; `src/monitor.py` listens and renders.
+Enabled via `monitor.enabled: true` in `config.yaml` (port 9911). The pipeline
+publishes fire-and-forget UDP datagrams; `src/monitor.py` listens and draws the
+operator panel.
 
 ```bash
 # Terminal 1
 python p300_speller/run.py train
 # Terminal 2
-python p300_speller/src/monitor.py --config p300_speller/configs/config.yaml
+python p300_speller/src/monitor.py --port 9911 --window 5
+# Panel check with SIMULATED data, no hardware and no pipeline:
+python p300_speller/src/monitor.py --demo
 ```
+
+Two datagram types are published:
+
+| Type | Payload | When |
+|---|---|---|
+| `S` (stream) | Raw, unfiltered µV, `(n_channels, n_samples)`, plus the **measured** sample rate | Every buffer pull |
+| `P` (epoch) | Baseline-corrected µV, `(n_channels, n_times)`, plus the target/non-target label | Calibration only |
+
+The measured rate is derived from the buffer's own timestamps, not echoed from
+`config.yaml`, so the panel can flag a front-end deviating more than 2% from
+nominal. Epochs are published **before** rejection, including the ones about to
+be discarded, because the panel applies the same 100 µV criterion independently
+to drive its own rejection-rate readout — sending only survivors would pin that
+readout at 0%. During free spelling the label is unknown, so no epochs are
+published and the ERP panel stays idle rather than accumulating guesses.
 
 The split exists because only one process may hold the serial port, and drawing
 must not compete with the pygame stimulus loop or the serial reader thread. If
@@ -197,7 +216,7 @@ Two caveats travel with these numbers:
 
 ```bash
 pip install -r requirements.txt
-pytest -q                 # 88 tests
+pytest -q                 # 98 tests
 python run.py selftest    # headless end-to-end on the Simulator
 ```
 

@@ -18,7 +18,8 @@ import pytest
 import yaml
 
 from acquisition import BaseEEGSource, StimulusMarker
-from main_pipeline import MonitorPublisher, P300Pipeline
+from main_pipeline import P300Pipeline
+from monitor import MonitorState, drain, make_socket
 
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -177,24 +178,75 @@ def test_empty_buffer_returns_empty_report(config: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Monitor publisher must never disturb a recording
+# Operator monitor feed
 # --------------------------------------------------------------------------- #
+_MON_PORT = 9789
+
+
 def test_monitor_disabled_by_default(config: dict) -> None:
     ts, data = _buffer()
     pipe = _pipeline(config, ts, data)
     assert pipe.monitor.enabled is False
-    # Publishing while disabled is a silent no-op, not an error.
-    pipe.monitor.publish_event("noop")
-    pipe.monitor.publish_signal(ts, data, FS, ["Fz", "Cz", "Pz"])
+    # A full collect with the monitor off must not raise.
+    pipe._collect_epochs(_markers([2.0, 4.0]), target_rc=(0, 0))
 
 
-def test_monitor_publish_never_raises_without_a_listener() -> None:
-    """Nothing is bound to the port; UDP sends must still be harmless."""
-    pub = MonitorPublisher(port=9751, enabled=True)
-    ts, data = _buffer(2.0)
-    pub.publish_signal(ts, data, FS, ["Fz", "Cz", "Pz"])
-    pub.publish_event("character_cue", "A")
-    pub.close()
-    # Closing twice is safe, and post-close publishing is a no-op.
-    pub.close()
-    pub.publish_event("after_close")
+def test_pipeline_publishes_raw_signal_and_labelled_epochs(config: dict) -> None:
+    """The end-to-end feed: the pipeline's publisher must speak the protocol the
+    monitor's receiver actually parses."""
+    config["monitor"] = {"enabled": True, "host": "127.0.0.1", "port": _MON_PORT}
+    ts, data = _buffer()
+    _contaminate(data, 4.2, 900.0)
+
+    sock = make_socket(_MON_PORT)
+    try:
+        pipe = _pipeline(config, ts, data)
+        assert pipe.monitor.enabled is True
+        pipe._collect_epochs(_markers([2.0, 4.0, 6.0, 8.0]), target_rc=(0, 0))
+
+        state = MonitorState(3, FS, 2.0, ["Fz", "Cz", "Pz"])
+        drain(sock, state)
+    finally:
+        sock.close()
+
+    # The raw chunk arrived, with a measured (not nominal) rate.
+    assert state.fs_measured == pytest.approx(FS, rel=1e-6)
+    assert not np.allclose(state.raw, 0.0)
+
+    # All four epochs were published, including the contaminated one, so the
+    # panel's own rejection counter is meaningful.
+    assert state.epochs_seen == 4
+    assert state.epochs_rejected == 1
+    # Marker 0 is a row-0 flash, so exactly one epoch is a target.
+    assert state.erp_count.get(1, 0) == 1
+
+
+def test_spelling_publishes_no_epochs(config: dict) -> None:
+    """During free spelling the label is unknown, so epochs must not be pushed
+    into the ERP average as guesses."""
+    config["monitor"] = {"enabled": True, "host": "127.0.0.1", "port": _MON_PORT}
+    ts, data = _buffer()
+
+    sock = make_socket(_MON_PORT)
+    try:
+        pipe = _pipeline(config, ts, data)
+        pipe._collect_epochs(_markers([2.0, 4.0]))      # no target_rc
+        state = MonitorState(3, FS, 2.0, ["Fz", "Cz", "Pz"])
+        drain(sock, state)
+    finally:
+        sock.close()
+
+    assert not np.allclose(state.raw, 0.0)   # raw stream still flows
+    assert state.epochs_seen == 0            # but no labelled epochs
+
+
+def test_measured_rate_reflects_the_actual_timestamps(config: dict) -> None:
+    """A front-end running slow must be visible to the operator, so the measured
+    rate is derived from timestamps rather than echoed from config."""
+    n = 2000
+    slow_ts = np.arange(n) / 200.0            # 200 Hz against a 250 Hz nominal
+    data = np.random.default_rng(0).normal(0.0, 2.0, size=(n, 3))
+    pipe = _pipeline(config, slow_ts, data)
+    assert pipe._measured_fs(slow_ts) == pytest.approx(200.0, rel=1e-6)
+    assert pipe._measured_fs(np.empty(0)) == pytest.approx(FS)
+    assert pipe._measured_fs(np.zeros(5)) == pytest.approx(FS)

@@ -200,19 +200,19 @@ speller:
 # -----------------------------------------------------------------------------
 # Operator monitor (optional live display, separate process)
 # -----------------------------------------------------------------------------
-# When enabled the pipeline publishes its RAW buffer and artifact-rejection
-# state as UDP datagrams on loopback; `src/monitor.py` listens and renders them.
-# The display applies its own CAUSAL filter (sosfilt with carried state), which
-# is deliberately not the zero-phase filter used for analysis. No reported
-# result is attributable to the display filter.
+# When enabled the pipeline publishes its RAW buffer, plus labelled epochs
+# during calibration, as UDP datagrams on loopback; `src/monitor.py` listens and
+# draws the operator panel (traces, DC offset, saturation, rejection rate, and a
+# running ERP at Cz). The display applies its own CAUSAL filter (sosfilt with
+# carried state), which is deliberately not the zero-phase filter used for
+# analysis. No reported result is attributable to the display filter.
 #
 # Publishing is fire-and-forget: with no monitor running, datagrams are simply
 # discarded and the recording is unaffected.
 monitor:
   enabled: false
   host: "127.0.0.1"
-  port: 9750
-  max_samples: 500            # newest-N samples per frame (bounds datagram size)
+  port: 9911                  # must match src/monitor.py DEFAULT_PORT
 
 # -----------------------------------------------------------------------------
 # Session / operation

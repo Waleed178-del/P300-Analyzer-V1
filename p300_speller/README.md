@@ -26,7 +26,7 @@ p300_speller/
 │   ├── features.py               # spatial filter, downsample, flatten
 │   ├── classifier.py             # StandardScaler + LDA/LinearSVC, grouped CV, save/load
 │   ├── stimulus.py               # pygame 6x6 grid, row/column flashing, perf_counter markers
-│   ├── monitor.py                # standalone operator display (causal filter, separate process)
+│   ├── monitor.py                # operator panel + UDP publisher (causal filter, separate process)
 │   ├── session.py                # session manager: phases, prompts, logging
 │   └── main_pipeline.py          # train / spell orchestration + event hooks
 ├── tests/
@@ -100,18 +100,25 @@ Arduino, and `acquisition.serial.port` to your device's port.
 Set `monitor.enabled: true` in `config.yaml`, then in a second terminal:
 
 ```bash
-python p300_speller/src/monitor.py --config p300_speller/configs/config.yaml
+python p300_speller/src/monitor.py --port 9911 --window 5
+
+# Check the panel with SIMULATED data — no hardware, no pipeline:
+python p300_speller/src/monitor.py --demo
 ```
 
-It shows per-channel RMS and peak-to-peak against the rejection threshold, plus
-the live rejection rate. It runs in its own process, applies its own **causal**
-display filter, and never touches the analysis path — no reported result is
-attributable to it.
+The panel shows live traces against the 100 µV rejection band, per-channel DC
+offset and saturation state, the measured-vs-nominal sample rate, the running
+rejection percentage, and a running ERP at Cz split by target/non-target.
+Keys: `[` / `]` scale, `r` resets counters, `q` quits.
+
+It runs in its own process, never opens the serial port, applies its own
+**causal** display filter, and never touches the analysis path — no reported
+result is attributable to it.
 
 ## Tests
 
 ```bash
-pytest -q            # 88 unit + integration tests
+pytest -q            # 98 unit + integration tests
 ```
 
 The headless `selftest` is the integration check: it calibrates and then spells

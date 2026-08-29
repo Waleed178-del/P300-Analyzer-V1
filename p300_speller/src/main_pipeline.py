@@ -27,8 +27,6 @@ against the flash markers that were recorded during presentation.
 
 from __future__ import annotations
 
-import json
-import socket
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -46,6 +44,7 @@ from classifier import (
 )
 from acquisition import BaseEEGSource, Simulator, StimulusMarker, build_source
 from features import epochs_to_matrix
+from monitor import DEFAULT_PORT as _MONITOR_DEFAULT_PORT, MonitorPublisher
 from processing import (
     Epoch,
     RejectionReport,
@@ -62,116 +61,9 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-class MonitorPublisher:
-    """Best-effort UDP publisher feeding the standalone operator monitor.
-
-    The operator display (:mod:`monitor`) must run in its own process: only one
-    process may hold the serial port, and redrawing a scrolling trace must never
-    compete with the pygame stimulus loop or the serial reader thread for the
-    GIL. The two are therefore decoupled by a datagram socket on loopback — the
-    pipeline pushes, the monitor listens, and neither blocks the other.
-
-    Every operation is deliberately failure-tolerant: a monitor that is not
-    running, a full socket buffer, or an oversized frame must never disturb an
-    in-progress recording. Publishing is fire-and-forget by construction (UDP),
-    so no acknowledgement is awaited.
-
-    Args:
-        host: Destination address (loopback by default).
-        port: Destination UDP port.
-        enabled: When ``False`` every method is a no-op.
-        max_samples: Newest-N samples included per data frame, bounding the
-            datagram well below the 65507-byte UDP payload limit.
-    """
-
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 9750,
-        enabled: bool = False,
-        max_samples: int = 500,
-    ) -> None:
-        self.host = host
-        self.port = int(port)
-        self.enabled = bool(enabled)
-        self.max_samples = int(max_samples)
-        self._sock: Optional[socket.socket] = None
-        if self.enabled:
-            try:
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self._sock.setblocking(False)
-            except Exception:
-                self._sock = None
-                self.enabled = False
-
-    def _send(self, payload: dict) -> None:
-        """Serialise and emit one datagram, swallowing every transport error."""
-        if not self.enabled or self._sock is None:
-            return
-        try:
-            self._sock.sendto(
-                json.dumps(payload).encode("utf-8"), (self.host, self.port)
-            )
-        except Exception:
-            # BlockingIOError (full buffer), ENETUNREACH, oversized frame — all
-            # are non-events for the recording. Never propagate.
-            pass
-
-    def publish_signal(
-        self,
-        timestamps: np.ndarray,
-        data: np.ndarray,
-        fs: float,
-        channel_names: List[str],
-    ) -> None:
-        """Publish the newest slice of the continuous buffer for display."""
-        if not self.enabled or data.shape[0] == 0:
-            return
-        n = min(self.max_samples, data.shape[0])
-        self._send(
-            {
-                "type": "signal",
-                "fs": float(fs),
-                "channels": list(channel_names),
-                "t0": float(timestamps[-n]),
-                # Rounded to 3 dp: display precision, not analysis precision.
-                "data": np.round(data[-n:, :], 3).tolist(),
-            }
-        )
-
-    def publish_quality(self, report: RejectionReport) -> None:
-        """Publish the artifact-rejection state of the last epoch batch."""
-        if not self.enabled:
-            return
-        self._send(
-            {
-                "type": "quality",
-                "n_total": report.n_total,
-                "n_kept": report.n_kept,
-                "n_rejected": report.n_rejected,
-                "rejection_rate": report.rejection_rate,
-                "threshold_uv": report.threshold_uv,
-                "session_valid": report.session_valid,
-                "max_ptp_uv": (
-                    float(np.max(report.peak_to_peak_uv))
-                    if report.peak_to_peak_uv.size
-                    else 0.0
-                ),
-            }
-        )
-
-    def publish_event(self, event_type: str, text: str = "") -> None:
-        """Publish a short lifecycle annotation (cue, selection, phase change)."""
-        self._send({"type": "event", "event": event_type, "text": text})
-
-    def close(self) -> None:
-        """Release the socket. Safe to call repeatedly."""
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            finally:
-                self._sock = None
-        self.enabled = False
+def monitor_default_port() -> int:
+    """The monitor's own default UDP port, so the two never drift apart."""
+    return int(_MONITOR_DEFAULT_PORT)
 
 
 @dataclass
@@ -214,14 +106,15 @@ class P300Pipeline:
         self.source: BaseEEGSource = source if source is not None else build_source(config)
         self.speller = SpellerMatrix(config)
 
-        # Operator monitor feed. Opt-in via the `monitor` config section; when
-        # absent or disabled every publish call is a no-op.
+        # Operator monitor feed (see :mod:`monitor`). Opt-in via the `monitor`
+        # config section; when disabled every publish call is a no-op. The
+        # publisher is fire-and-forget UDP, so a monitor that is absent, slow,
+        # or dead cannot affect the recording.
         mon_cfg = config.get("monitor") or {}
         self.monitor = MonitorPublisher(
             host=mon_cfg.get("host", "127.0.0.1"),
-            port=mon_cfg.get("port", 9750),
+            port=int(mon_cfg.get("port", monitor_default_port())),
             enabled=bool(mon_cfg.get("enabled", False)),
-            max_samples=int(mon_cfg.get("max_samples", 500)),
         )
 
         # Cumulative artifact-rejection tally for the whole session, so the
@@ -249,10 +142,6 @@ class P300Pipeline:
                 ``character_decoded``, ``spell_complete``.
             **data: Event-specific payload forwarded verbatim to the listener.
         """
-        # Mirror the annotation to the operator monitor (no-op when disabled).
-        self.monitor.publish_event(
-            event_type, str(data.get("symbol", data.get("text", "")))
-        )
         if self.event_listener is not None:
             self.event_listener(event_type, data)
         else:
@@ -288,8 +177,24 @@ class P300Pipeline:
         """Seconds to wait after the last flash so its epoch is fully buffered."""
         return float(self.epoch_cfg["tmax_s"]) + 0.2
 
+    def _measured_fs(self, timestamps: np.ndarray) -> float:
+        """Sample rate implied by the buffer's own timestamps.
+
+        The monitor flags a measured rate that deviates from nominal by more
+        than 2%, which is how a struggling front-end announces itself. Reporting
+        the configured rate here would defeat that check.
+        """
+        if timestamps.size < 2:
+            return float(self.fs)
+        span = float(timestamps[-1] - timestamps[0])
+        if span <= 0.0:
+            return float(self.fs)
+        return float(timestamps.size - 1) / span
+
     def _collect_epochs(
-        self, markers: List[StimulusMarker]
+        self,
+        markers: List[StimulusMarker],
+        target_rc: Optional[Tuple[int, int]] = None,
     ) -> Tuple[List[Epoch], RejectionReport]:
         """Acquire, precondition, epoch, and artifact-screen around ``markers``.
 
@@ -299,6 +204,12 @@ class P300Pipeline:
 
         Args:
             markers: The flash markers recorded for the current character.
+            target_rc: ``(row, col)`` of the cued character during calibration,
+                enabling each epoch to be published to the operator monitor with
+                its true target/non-target label. ``None`` during free spelling,
+                where the label is by definition unknown; the monitor then
+                receives the raw stream only and its ERP panel stays idle rather
+                than accumulating guesses.
 
         Returns:
             ``(epochs, rejection_report)`` where ``epochs`` are the
@@ -311,10 +222,8 @@ class P300Pipeline:
         # The monitor receives the RAW buffer, not the conditioned one: the
         # display applies its own causal filter, and keeping the two paths
         # independent is what allows the claim that no reported result depends
-        # on the display filter.
-        self.monitor.publish_signal(
-            timestamps, data, self.fs, self.source.channel_names
-        )
+        # on the display filter. Their wire format is (n_channels, n_samples).
+        self.monitor.publish_chunk(data.T, self._measured_fs(timestamps))
         conditioned = precondition(data, self.fs, self.proc_cfg)
 
         epochs = epoch_data(
@@ -330,13 +239,35 @@ class P300Pipeline:
             ),
         )
 
+        # Publish every epoch, including the ones about to be rejected: the
+        # monitor applies the same 100 uV criterion independently to drive its
+        # own rejection-rate readout, so sending only survivors would make that
+        # readout permanently 0%.
+        if target_rc is not None:
+            self._publish_epochs(epochs, target_rc)
+
         kept, report = reject_artifacts_from_config(epochs, self.proc_cfg)
         self.session_epochs_seen += report.n_total
         self.session_epochs_rejected += report.n_rejected
-        self.monitor.publish_quality(report)
         if report.n_rejected:
             self._emit("epochs_rejected", report=report)
         return kept, report
+
+    def _publish_epochs(
+        self, epochs: List[Epoch], target_rc: Tuple[int, int]
+    ) -> None:
+        """Send labelled epochs to the operator monitor's running ERP panel."""
+        target_row, target_col = target_rc
+        for ep in epochs:
+            label = (
+                TARGET
+                if (
+                    (ep.marker.kind == "row" and ep.marker.index == target_row)
+                    or (ep.marker.kind == "col" and ep.marker.index == target_col)
+                )
+                else NON_TARGET
+            )
+            self.monitor.publish_epoch(ep.data.T, label)
 
     # ------------------------------------------------------------------ #
     # Session-level data-quality gate
@@ -493,7 +424,9 @@ class P300Pipeline:
         markers = self.speller.run_character_flashes(self.source, n_sequences)
         time.sleep(self._post_roll_s())
 
-        epochs, _rejection = self._collect_epochs(markers)
+        epochs, _rejection = self._collect_epochs(
+            markers, target_rc=(target_row, target_col)
+        )
         if not epochs:
             return np.empty((0, 0)), np.empty((0,))
 

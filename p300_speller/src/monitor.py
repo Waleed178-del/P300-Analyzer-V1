@@ -1,424 +1,448 @@
-"""monitor.py — standalone operator display for live signal-quality checking.
+"""
+Operator acquisition monitor for the P300 speller.
 
-WHY THIS IS A SEPARATE PROCESS
-------------------------------
-Only one process may hold the serial port, and redrawing a scrolling trace must
-never compete with the pygame stimulus loop or the serial reader thread. The
-recording process therefore *publishes* its raw buffer as UDP datagrams on
-loopback (see :class:`main_pipeline.MonitorPublisher`) and this module listens.
-Publishing is fire-and-forget: if the monitor is not running, is slow, or dies,
-the recording is unaffected.
+Runs as a SEPARATE OS PROCESS from run.py. The pipeline publishes small UDP
+datagrams to loopback; this process receives them and draws the operator panel.
 
-DISPLAY FILTER vs ANALYSIS FILTER — THE IMPORTANT PART
-------------------------------------------------------
-This module filters with :func:`scipy.signal.sosfilt`, a **causal, stateful**
-filter whose internal state ``zi`` is carried from one datagram to the next so
-the displayed trace is continuous. :mod:`processing`, which produces every
-number that is ever reported, filters with :func:`scipy.signal.sosfiltfilt`, a
-**zero-phase** filter that runs the signal forwards and then backwards.
+Rationale for the process split
+-------------------------------
+1. Only one process may hold the serial port. This module NEVER opens it.
+2. Drawing must not compete with the pygame stimulus loop or the serial reader
+   thread that carry the timing-critical path. Publishing costs one non-blocking
+   sendto per chunk.
 
-The two are not interchangeable:
+Display filtering
+-----------------
+This module uses its own CAUSAL, STATEFUL filter (sosfilt with zi), which is a
+DIFFERENT filter from the zero-phase sosfiltfilt used in src/processing.py for
+analysis. Zero-phase filtering requires future samples and cannot be applied to
+a live buffer. Nothing drawn here ever feeds the classifier or the results.
 
-* A causal IIR filter has a non-zero, frequency-dependent group delay
-  ``tau(w) = -d(phase(w))/dw``. It shifts and disperses the waveform in time,
-  which would bias any P300 latency measurement taken from it.
-* Forward-backward filtering conjugates the phase response, so the net phase is
-  identically zero at every frequency and therefore the group delay is
-  identically zero. Latency is preserved, which is why it is used for analysis.
+Usage
+-----
+    python src/monitor.py                       # listen for the pipeline
+    python src/monitor.py --demo                # SIMULATED DATA, no hardware
+    python src/monitor.py --port 9911 --window 5
 
-A causal filter is nonetheless the correct choice *here*, because a display must
-show the operator what is happening now and cannot wait for the future samples
-that a backward pass requires.
-
-**No reported result is attributable to the display filter.** This module is an
-operator aid only. It never writes to the model, the epoch store, or the result
-files; it consumes a copy of the raw stream and renders it.
-
-Usage::
-
-    # Terminal 1 — enable `monitor.enabled: true` in config.yaml, then record:
-    python p300_speller/run.py train
-
-    # Terminal 2 — watch the live signal-quality readout:
-    python p300_speller/src/monitor.py --config p300_speller/configs/config.yaml
+Keys: [ and ] change the vertical scale, r resets counters, q quits.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import socket
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfilt_zi
+from scipy.signal import butter, iirnotch, sosfilt, sosfilt_zi, tf2sos
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 9750
-# Max UDP payload; frames larger than this are dropped by the transport anyway.
-_RECV_BUFSIZE = 65535
+# --------------------------------------------------------------------------
+# Wire protocol. Little endian, no padding.
+#   b'S' + <I n_ch><I n_samp><d fs_measured> + float32[n_ch * n_samp]  raw uV
+#   b'P' + <B label><I n_ch><I n_samp>       + float32[n_ch * n_samp]  epoch uV
+# label: 1 = target flash, 0 = non-target flash
+# --------------------------------------------------------------------------
+
+MAGIC_STREAM = b"S"
+MAGIC_EPOCH = b"P"
+DEFAULT_PORT = 9911
+MAX_DATAGRAM = 65507
+
+# Locked project constants. Keep in sync with configs/config.yaml.
+REJECT_UV = 100.0            # peak-to-peak per epoch, np.ptp, per channel
+SCALE_UV_PER_COUNT = 0.131718  # includes the 949x analogue gain divisor
+ADC_FULLSCALE_COUNTS = 32767
+SATURATION_UV = 0.95 * ADC_FULLSCALE_COUNTS * SCALE_UV_PER_COUNT
+
+OKABE_ITO = [(230, 159, 0), (0, 114, 178), (0, 158, 115),
+             (204, 121, 167), (86, 180, 233), (213, 94, 0)]
 
 
-# --------------------------------------------------------------------------- #
-# Causal display filter
-# --------------------------------------------------------------------------- #
+# ==========================================================================
+# Publisher. Import this from main_pipeline.py. It is deliberately tiny.
+# ==========================================================================
+
+class MonitorPublisher:
+    """Fire-and-forget UDP sender. Never raises, never blocks, never retries."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
+                 enabled: bool = True) -> None:
+        self.addr = (host, port)
+        self.enabled = enabled
+        self._sock: socket.socket | None = None
+        if enabled:
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock.setblocking(False)
+            except OSError:
+                self.enabled = False
+
+    def _send(self, payload: bytes) -> None:
+        if not self.enabled or self._sock is None:
+            return
+        if len(payload) > MAX_DATAGRAM:
+            return
+        try:
+            self._sock.sendto(payload, self.addr)
+        except (BlockingIOError, OSError):
+            pass  # dropping a display frame is always cheaper than blocking
+
+    def publish_chunk(self, data_uv: np.ndarray, fs_measured: float) -> None:
+        """data_uv: (n_channels, n_new_samples), RAW microvolts, unfiltered."""
+        arr = np.ascontiguousarray(np.atleast_2d(data_uv), dtype=np.float32)
+        header = MAGIC_STREAM + struct.pack("<IId", arr.shape[0], arr.shape[1],
+                                            float(fs_measured))
+        self._send(header + arr.tobytes())
+
+    def publish_epoch(self, epoch_uv: np.ndarray, label: int) -> None:
+        """epoch_uv: (n_channels, n_times), baseline-corrected microvolts."""
+        arr = np.ascontiguousarray(np.atleast_2d(epoch_uv), dtype=np.float32)
+        header = MAGIC_EPOCH + struct.pack("<BII", int(label) & 1,
+                                           arr.shape[0], arr.shape[1])
+        self._send(header + arr.tobytes())
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+
+# ==========================================================================
+# Causal display filter. NOT the analysis filter.
+# ==========================================================================
+
 class CausalDisplayFilter:
-    """Stateful causal band-pass for continuous display.
+    """Order-2 Butterworth band-pass plus notch, stateful across chunks."""
 
-    Unlike the zero-phase :func:`processing.apply_bandpass` used for analysis,
-    this filter runs forwards only and preserves its delay state across calls,
-    so successive datagrams join without a discontinuity at the seam. It
-    introduces a real group delay; that is acceptable for a display and
-    unacceptable for latency analysis.
+    def __init__(self, fs: float, n_channels: int, low: float = 1.0,
+                 high: float = 30.0, notch_hz: float = 50.0, q: float = 30.0):
+        nyq = fs / 2.0
+        high = min(high, nyq * 0.95)
+        sos_bp = butter(2, [low / nyq, high / nyq], btype="band", output="sos")
+        b, a = iirnotch(notch_hz / nyq, q)
+        self.sos = np.vstack([sos_bp, tf2sos(b, a)])
+        zi_unit = sosfilt_zi(self.sos)
+        self.zi = np.repeat(zi_unit[:, None, :], n_channels, axis=1)
+        self.primed = np.zeros(n_channels, dtype=bool)
 
-    Args:
-        low_hz: Lower pass-band edge.
-        high_hz: Upper pass-band edge.
-        fs: Sampling rate in Hz.
-        n_channels: Number of channels (one filter state per channel).
-        order: Butterworth order per edge.
-    """
-
-    def __init__(
-        self,
-        low_hz: float,
-        high_hz: float,
-        fs: float,
-        n_channels: int,
-        order: int = 4,
-    ) -> None:
-        nyq = 0.5 * fs
-        low, high = low_hz / nyq, high_hz / nyq
-        if not (0.0 < low < high < 1.0):
-            raise ValueError(
-                f"Invalid display band: {low_hz}-{high_hz} Hz at fs={fs} Hz"
-            )
-        self.sos = butter(order, [low, high], btype="bandpass", output="sos")
-        self.n_channels = n_channels
-        # One independent delay-line state per channel, primed to the steady
-        # state so the first block does not open with a large transient. With
-        # axis=0 and input (n_samples, n_channels), sosfilt requires zi of
-        # shape (n_sections, 2, n_channels).
-        zi_unit = sosfilt_zi(self.sos)                      # (n_sections, 2)
-        self._zi = np.repeat(zi_unit[:, :, None], n_channels, axis=2)
-        self._primed = False
-
-    def reset(self) -> None:
-        """Drop the filter state (use when the stream is discontinuous)."""
-        self._primed = False
-
-    def process(self, block: np.ndarray) -> np.ndarray:
-        """Filter one contiguous block, carrying state across calls.
-
-        Args:
-            block: Array of shape ``(n_samples, n_channels)``.
-
-        Returns:
-            Filtered array of the same shape.
-        """
-        if block.size == 0:
-            return block
-        if not self._primed:
-            # Scale the steady-state condition by the first sample so the
-            # filter starts settled at the current DC level.
-            zi_unit = sosfilt_zi(self.sos)
-            self._zi = np.stack(
-                [zi_unit * block[0, c] for c in range(block.shape[1])], axis=2
-            )
-            self._primed = True
-        out, self._zi = sosfilt(self.sos, block, axis=0, zi=self._zi)
+    def __call__(self, chunk: np.ndarray) -> np.ndarray:
+        out = np.empty_like(chunk, dtype=np.float64)
+        for ch in range(chunk.shape[0]):
+            if not self.primed[ch] and chunk.shape[1] > 0:
+                self.zi[:, ch, :] *= chunk[ch, 0]
+                self.primed[ch] = True
+            out[ch], self.zi[:, ch, :] = sosfilt(
+                self.sos, chunk[ch], zi=self.zi[:, ch, :])
         return out
 
 
-# --------------------------------------------------------------------------- #
-# Rolling state
-# --------------------------------------------------------------------------- #
+# ==========================================================================
+# State
+# ==========================================================================
+
 @dataclass
 class MonitorState:
-    """Everything the renderer needs to draw one frame."""
+    n_channels: int
+    fs_nominal: float
+    window_s: float
+    labels: list[str]
 
-    channels: List[str] = field(default_factory=list)
-    fs: float = 250.0
-    last_sample_time: float = -np.inf
-    n_samples_seen: int = 0
-    rms_uv: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    ptp_uv: np.ndarray = field(default_factory=lambda: np.zeros(0))
-    # Latest artifact-rejection snapshot published by the pipeline.
-    rejection_rate: float = 0.0
-    n_rejected: int = 0
-    n_total: int = 0
-    threshold_uv: float = 100.0
-    session_valid: bool = True
-    last_event: str = ""
-    last_update: float = 0.0
+    fs_measured: float = 0.0
+    last_packet_t: float = 0.0
 
+    epochs_seen: int = 0
+    epochs_rejected: int = 0
 
-# --------------------------------------------------------------------------- #
-# Subscriber
-# --------------------------------------------------------------------------- #
-class MonitorSubscriber:
-    """Receives pipeline datagrams and maintains a :class:`MonitorState`.
+    erp_sum: dict = field(default_factory=dict)
+    erp_count: dict = field(default_factory=dict)
 
-    Args:
-        host: Bind address.
-        port: Bind port.
-        band: ``(low_hz, high_hz)`` for the causal display filter.
-        window_s: Length of the rolling window used for the RMS / peak-to-peak
-            readout.
-    """
+    def __post_init__(self) -> None:
+        n = int(round(self.fs_nominal * self.window_s))
+        self.raw = np.zeros((self.n_channels, n), dtype=np.float64)
+        self.disp = np.zeros((self.n_channels, n), dtype=np.float64)
+        self.filt = CausalDisplayFilter(self.fs_nominal, self.n_channels)
 
-    def __init__(
-        self,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT,
-        band: tuple = (0.5, 30.0),
-        window_s: float = 2.0,
-    ) -> None:
-        self.band = band
-        self.window_s = window_s
-        self.state = MonitorState()
-        self._filter: Optional[CausalDisplayFilter] = None
-        self._window: Optional[np.ndarray] = None
-
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((host, port))
-        self._sock.settimeout(0.25)
-
-    def close(self) -> None:
-        """Release the socket."""
-        try:
-            self._sock.close()
-        except Exception:
-            pass
-
-    def poll(self) -> bool:
-        """Read and apply one pending datagram.
-
-        Returns:
-            ``True`` if a datagram was processed, ``False`` on timeout.
-        """
-        try:
-            raw, _addr = self._sock.recvfrom(_RECV_BUFSIZE)
-        except socket.timeout:
-            return False
-        except OSError:
-            return False
-        try:
-            msg = json.loads(raw.decode("utf-8"))
-        except Exception:
-            # Malformed frame: a display must never crash on bad input.
-            return False
-        self._apply(msg)
-        return True
-
-    def _apply(self, msg: dict) -> None:
-        kind = msg.get("type")
-        if kind == "signal":
-            self._apply_signal(msg)
-        elif kind == "quality":
-            st = self.state
-            st.n_total = int(msg.get("n_total", 0))
-            st.n_rejected = int(msg.get("n_rejected", 0))
-            st.rejection_rate = float(msg.get("rejection_rate", 0.0))
-            st.threshold_uv = float(msg.get("threshold_uv", 100.0))
-            st.session_valid = bool(msg.get("session_valid", True))
-            st.last_update = time.time()
-        elif kind == "event":
-            text = str(msg.get("text", ""))
-            self.state.last_event = (
-                f"{msg.get('event', '')} {text}".strip()
-            )
-            self.state.last_update = time.time()
-
-    def _apply_signal(self, msg: dict) -> None:
-        """Filter and accumulate the genuinely new samples in a signal frame.
-
-        The pipeline publishes overlapping slices of its ring buffer. Feeding
-        overlapping samples into a stateful filter would corrupt its state, so
-        only samples newer than the last one seen are processed.
-        """
-        data = np.asarray(msg.get("data", []), dtype=np.float64)
-        if data.ndim != 2 or data.size == 0:
+    def push(self, chunk_uv: np.ndarray, fs_measured: float) -> None:
+        if chunk_uv.size == 0:
             return
-        fs = float(msg.get("fs", 250.0))
-        t0 = float(msg.get("t0", 0.0))
-        channels = list(msg.get("channels", []))
+        n = chunk_uv.shape[1]
+        if n >= self.raw.shape[1]:
+            chunk_uv = chunk_uv[:, -self.raw.shape[1]:]
+            n = chunk_uv.shape[1]
+        self.raw = np.roll(self.raw, -n, axis=1)
+        self.raw[:, -n:] = chunk_uv
+        self.disp = np.roll(self.disp, -n, axis=1)
+        self.disp[:, -n:] = self.filt(chunk_uv)
+        self.fs_measured = fs_measured
+        self.last_packet_t = time.perf_counter()
 
-        st = self.state
-        if channels and channels != st.channels:
-            # Montage changed (or first frame): rebuild the filter and window.
-            st.channels = channels
-            st.fs = fs
-            self._filter = CausalDisplayFilter(
-                self.band[0], self.band[1], fs, data.shape[1]
-            )
-            self._window = None
-            st.last_sample_time = -np.inf
+    def push_epoch(self, epoch_uv: np.ndarray, label: int) -> None:
+        self.epochs_seen += 1
+        if float(np.max(np.ptp(epoch_uv, axis=1))) > REJECT_UV:
+            self.epochs_rejected += 1
+            return  # rejected epochs never enter the ERP average
+        cz = min(1, epoch_uv.shape[0] - 1)
+        trace = epoch_uv[cz].astype(np.float64)
+        if label not in self.erp_sum or self.erp_sum[label].shape != trace.shape:
+            self.erp_sum[label] = np.zeros_like(trace)
+            self.erp_count[label] = 0
+        self.erp_sum[label] += trace
+        self.erp_count[label] += 1
 
-        if self._filter is None:
-            self._filter = CausalDisplayFilter(
-                self.band[0], self.band[1], fs, data.shape[1]
-            )
+    def erp_mean(self, label: int) -> np.ndarray | None:
+        if self.erp_count.get(label, 0) == 0:
+            return None
+        return self.erp_sum[label] / self.erp_count[label]
 
-        times = t0 + np.arange(data.shape[0]) / fs
-        fresh = times > st.last_sample_time
-        if not np.any(fresh):
+    @property
+    def rejection_pct(self) -> float:
+        if self.epochs_seen == 0:
+            return 0.0
+        return 100.0 * self.epochs_rejected / self.epochs_seen
+
+    def dc_offset_uv(self, ch: int) -> float:
+        return float(np.mean(self.raw[ch]))
+
+    def saturated(self, ch: int) -> bool:
+        return bool(np.max(np.abs(self.raw[ch])) >= SATURATION_UV)
+
+    def reset_counters(self) -> None:
+        self.epochs_seen = 0
+        self.epochs_rejected = 0
+        self.erp_sum.clear()
+        self.erp_count.clear()
+
+
+# ==========================================================================
+# Receiver
+# ==========================================================================
+
+def make_socket(port: int) -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+    s.bind(("127.0.0.1", port))
+    s.setblocking(False)
+    return s
+
+
+def drain(sock: socket.socket, state: MonitorState, budget: int = 64) -> None:
+    for _ in range(budget):
+        try:
+            payload, _ = sock.recvfrom(MAX_DATAGRAM)
+        except (BlockingIOError, OSError):
             return
-        block = data[fresh, :]
-        st.last_sample_time = float(times[fresh][-1])
-        st.n_samples_seen += int(block.shape[0])
-
-        filtered = self._filter.process(block)
-        self._window = (
-            filtered
-            if self._window is None
-            else np.vstack([self._window, filtered])
-        )
-        keep = int(self.window_s * fs)
-        if self._window.shape[0] > keep:
-            self._window = self._window[-keep:, :]
-
-        st.rms_uv = np.sqrt(np.mean(self._window ** 2, axis=0))
-        st.ptp_uv = np.ptp(self._window, axis=0)
-        st.last_update = time.time()
+        if not payload:
+            continue
+        tag, body = payload[:1], payload[1:]
+        try:
+            if tag == MAGIC_STREAM:
+                n_ch, n_s, fs = struct.unpack("<IId", body[:16])
+                arr = np.frombuffer(body[16:], dtype=np.float32, count=n_ch * n_s)
+                state.push(arr.reshape(n_ch, n_s).astype(np.float64), fs)
+            elif tag == MAGIC_EPOCH:
+                label, n_ch, n_s = struct.unpack("<BII", body[:9])
+                arr = np.frombuffer(body[9:], dtype=np.float32, count=n_ch * n_s)
+                state.push_epoch(arr.reshape(n_ch, n_s).astype(np.float64), label)
+        except (struct.error, ValueError):
+            continue  # malformed datagram, drop it
 
 
-# --------------------------------------------------------------------------- #
-# Terminal rendering
-# --------------------------------------------------------------------------- #
-def _bar(value: float, limit: float, width: int = 28) -> str:
-    """Render ``value`` as a fixed-width ASCII bar scaled to ``limit``."""
-    if limit <= 0:
-        return " " * width
-    filled = int(np.clip(value / limit, 0.0, 1.0) * width)
-    return "#" * filled + "-" * (width - filled)
+# ==========================================================================
+# Drawing
+# ==========================================================================
+
+BG = (18, 18, 20)
+FG = (232, 232, 228)
+MUTED = (140, 140, 136)
+GRID = (48, 48, 52)
+BAND = (58, 58, 66)
+GOOD = (0, 158, 115)
+WARN = (230, 159, 0)
+BAD = (213, 94, 0)
+
+W, H = 1180, 780
+TRACE_X0, TRACE_X1 = 150, 830
+PANEL_X = 855
 
 
-def render(state: MonitorState) -> str:
-    """Format the current state as a terminal dashboard."""
-    lines: List[str] = []
-    lines.append("=" * 62)
-    lines.append("  P300 OPERATOR MONITOR   (causal display filter — not analysis)")
-    lines.append("=" * 62)
+def draw(screen, font, big, state: MonitorState, uv_per_div: float,
+         demo: bool) -> None:
+    import pygame
 
-    thr = state.threshold_uv
-    if not state.channels:
-        # No signal frame yet. The per-channel table cannot be drawn, but the
-        # quality block below still must be: a session-invalidity alarm can
-        # arrive before the first signal frame and must never be swallowed.
-        lines.append("  waiting for signal frames ...")
-        lines.append("  (enable `monitor.enabled: true` in config.yaml, then")
-        lines.append("   start a session with `python p300_speller/run.py train`)")
-    else:
-        lines.append(
-            f"  {'ch':<5}{'RMS uV':>9}{'p-p uV':>9}   p-p vs {thr:.0f} uV limit"
-        )
-        for i, name in enumerate(state.channels):
-            rms = state.rms_uv[i] if i < state.rms_uv.size else 0.0
-            ptp = state.ptp_uv[i] if i < state.ptp_uv.size else 0.0
-            flag = " OVER" if ptp > thr else ""
-            lines.append(
-                f"  {name:<5}{rms:>9.1f}{ptp:>9.1f}   {_bar(ptp, thr)}{flag}"
-            )
+    screen.fill(BG)
+    n_ch = state.n_channels
+    top, bottom = 70, 470
+    lane_h = (bottom - top) / n_ch
+    px_per_uv = (lane_h * 0.42) / uv_per_div
 
-    lines.append("-" * 62)
-    if state.n_total:
-        lines.append(
-            f"  rejected {state.n_rejected}/{state.n_total} epochs "
-            f"({state.rejection_rate:.1%}) at {thr:.0f} uV peak-to-peak"
-        )
-    else:
-        lines.append("  no epochs screened yet")
+    stale = (time.perf_counter() - state.last_packet_t) > 1.0
+    fs_txt = f"{state.fs_measured:7.2f} Hz measured   {state.fs_nominal:.0f} Hz nominal"
+    fs_bad = state.fs_measured > 0 and abs(
+        state.fs_measured - state.fs_nominal) > 0.02 * state.fs_nominal
+    screen.blit(big.render("Acquisition monitor", True, FG), (20, 18))
+    screen.blit(font.render(fs_txt, True, BAD if fs_bad else FG), (300, 24))
+    screen.blit(font.render(f"scale {uv_per_div:.0f} uV/div  [ ]", True, MUTED),
+                (660, 24))
+    if demo:
+        screen.blit(big.render("SIMULATED DATA", True, BAD), (940, 18))
+    elif stale:
+        screen.blit(big.render("NO DATA", True, BAD), (990, 18))
 
-    if not state.session_valid:
-        lines.append("  *** SESSION INVALID — rejection rate over budget ***")
-        lines.append("  *** repeat the recording; do not report results  ***")
+    n_pts = state.disp.shape[1]
+    xs = np.linspace(TRACE_X0, TRACE_X1, n_pts)
+    step = max(1, n_pts // (TRACE_X1 - TRACE_X0))
 
-    lines.append(f"  samples seen: {state.n_samples_seen}")
-    if state.last_event:
-        lines.append(f"  last event  : {state.last_event}")
-    lines.append("=" * 62)
-    return "\n".join(lines)
+    for ch in range(n_ch):
+        mid = top + lane_h * (ch + 0.5)
+        half = (REJECT_UV / 2.0) * px_per_uv
+        pygame.draw.rect(screen, BAND,
+                         (TRACE_X0, mid - half, TRACE_X1 - TRACE_X0, 2 * half), 1)
+        pygame.draw.line(screen, GRID, (TRACE_X0, mid), (TRACE_X1, mid), 1)
 
+        colour = OKABE_ITO[ch % len(OKABE_ITO)]
+        ys = mid - np.clip(state.disp[ch] * px_per_uv, -lane_h / 2, lane_h / 2)
+        pts = list(zip(xs[::step], ys[::step]))
+        if len(pts) > 1:
+            pygame.draw.lines(screen, colour, False, pts, 1)
 
-def run_monitor(
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
-    band: tuple = (0.5, 30.0),
-    refresh_s: float = 0.5,
-) -> int:
-    """Listen and render until interrupted.
+        name = state.labels[ch] if ch < len(state.labels) else f"ch{ch}"
+        screen.blit(big.render(name, True, colour), (20, mid - 26))
+        dc_mv = state.dc_offset_uv(ch) / 1000.0
+        sat = state.saturated(ch)
+        screen.blit(font.render(f"DC {dc_mv:+7.2f} mV", True,
+                                WARN if abs(dc_mv) > 20 else MUTED),
+                    (20, mid - 4))
+        screen.blit(font.render("SATURATED" if sat else "in range", True,
+                                BAD if sat else GOOD), (20, mid + 16))
 
-    Returns:
-        Process exit status (0 on a clean Ctrl-C).
-    """
-    sub = MonitorSubscriber(host=host, port=port, band=band)
-    print(f"[monitor] listening on {host}:{port} — Ctrl-C to stop")
-    last_draw = 0.0
-    try:
-        while True:
-            sub.poll()
-            now = time.time()
-            if now - last_draw >= refresh_s:
-                # Clear screen without requiring curses.
-                sys.stdout.write("\033[2J\033[H")
-                sys.stdout.write(render(sub.state) + "\n")
-                sys.stdout.flush()
-                last_draw = now
-    except KeyboardInterrupt:
-        print("\n[monitor] stopped")
-        return 0
-    finally:
-        sub.close()
+    screen.blit(font.render(f"{REJECT_UV:.0f} uV p-p rejection band", True, MUTED),
+                (TRACE_X0, bottom + 8))
 
+    # counters
+    pct = state.rejection_pct
+    col = BAD if pct > 30 else (WARN if pct > 15 else GOOD)
+    screen.blit(big.render("Epoch quality", True, FG), (20, 520))
+    screen.blit(font.render(f"seen      {state.epochs_seen}", True, FG), (20, 552))
+    screen.blit(font.render(f"rejected  {state.epochs_rejected}", True, FG), (20, 574))
+    screen.blit(big.render(f"{pct:5.1f} %", True, col), (20, 600))
+    if pct > 30 and state.epochs_seen >= 20:
+        screen.blit(font.render("ABORT: session too noisy", True, BAD), (20, 636))
 
-def _load_monitor_config(path: Optional[str]) -> dict:
-    """Read the ``monitor`` and band settings from ``config.yaml`` if given."""
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        import yaml
+    # ERP panel
+    ex0, ey0, ew, eh = PANEL_X, 520, 300, 200
+    pygame.draw.rect(screen, GRID, (ex0, ey0, ew, eh), 1)
+    screen.blit(big.render("Running ERP at Cz", True, FG), (ex0, ey0 - 30))
+    mid_y = ey0 + eh / 2
+    pygame.draw.line(screen, GRID, (ex0, mid_y), (ex0 + ew, mid_y), 1)
+    for label, colour, tag in ((1, OKABE_ITO[0], "target"), (0, OKABE_ITO[1], "non-target")):
+        mean = state.erp_mean(label)
+        n = state.erp_count.get(label, 0)
+        screen.blit(font.render(f"{tag}  n={n}", True, colour),
+                    (ex0 + 6, ey0 + 6 + (0 if label == 1 else 20)))
+        if mean is None or mean.size < 2:
+            continue
+        scale = (eh * 0.4) / max(8.0, float(np.max(np.abs(mean))))
+        exs = np.linspace(ex0 + 4, ex0 + ew - 4, mean.size)
+        eys = mid_y - mean * scale
+        pygame.draw.lines(screen, colour, False, list(zip(exs, eys)), 2)
 
-        with open(path, "r", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh) or {}
-    except Exception:
-        return {}
-    mon = cfg.get("monitor") or {}
-    bp = (cfg.get("processing") or {}).get("bandpass") or {}
-    return {
-        "host": mon.get("host", DEFAULT_HOST),
-        "port": mon.get("port", DEFAULT_PORT),
-        "low_hz": bp.get("low_hz", 0.5),
-        "high_hz": bp.get("high_hz", 30.0),
-    }
+    screen.blit(font.render(
+        "display filter is causal and separate from the analysis filter",
+        True, MUTED), (PANEL_X, 740))
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="monitor.py",
-        description=(
-            "Live operator display for the P300 speller. Runs in its own "
-            "process and never touches the analysis path."
-        ),
-    )
-    parser.add_argument("--config", default=None, help="path to config.yaml")
-    parser.add_argument("--host", default=None, help="bind address")
-    parser.add_argument("--port", type=int, default=None, help="bind port")
-    parser.add_argument("--refresh", type=float, default=0.5,
-                        help="redraw interval in seconds")
-    args = parser.parse_args(argv)
+# ==========================================================================
+# Demo source. SIMULATED DATA. Never for results.
+# ==========================================================================
 
-    from_cfg = _load_monitor_config(args.config)
-    host = args.host or from_cfg.get("host", DEFAULT_HOST)
-    port = args.port or from_cfg.get("port", DEFAULT_PORT)
-    band = (from_cfg.get("low_hz", 0.5), from_cfg.get("high_hz", 30.0))
-    return run_monitor(host=host, port=port, band=band, refresh_s=args.refresh)
+class DemoSource:
+    def __init__(self, n_ch: int, fs: float, seed: int = 42):
+        self.n_ch, self.fs = n_ch, fs
+        self.rng = np.random.default_rng(seed)
+        self.t = 0.0
+        self.last = time.perf_counter()
+
+    def next_chunk(self):
+        now = time.perf_counter()
+        n = int((now - self.last) * self.fs)
+        if n < 1:
+            return None
+        self.last = now
+        t = self.t + np.arange(n) / self.fs
+        self.t = t[-1] + 1.0 / self.fs
+        out = np.empty((self.n_ch, n))
+        for ch in range(self.n_ch):
+            out[ch] = (12 * self.rng.standard_normal(n)
+                       + 8 * np.sin(2 * np.pi * 10 * t)
+                       + 6 * np.sin(2 * np.pi * 50 * t)
+                       + 300 * (ch + 1))
+        return out
+
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="P300 speller operator monitor")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--fs", type=float, default=250.0)
+    p.add_argument("--window", type=float, default=5.0)
+    p.add_argument("--channels", default="Fz,Cz,Pz")
+    p.add_argument("--uv-per-div", type=float, default=50.0)
+    p.add_argument("--demo", action="store_true",
+                   help="SIMULATED DATA. Verifies the panel without hardware.")
+    args = p.parse_args(argv)
+
+    import pygame
+
+    labels = [c.strip() for c in args.channels.split(",") if c.strip()]
+    state = MonitorState(len(labels), args.fs, args.window, labels)
+    demo = DemoSource(len(labels), args.fs) if args.demo else None
+    sock = None if args.demo else make_socket(args.port)
+
+    pygame.init()
+    pygame.display.set_caption("P300 acquisition monitor")
+    screen = pygame.display.set_mode((W, H))
+    font = pygame.font.SysFont("consolas,dejavusansmono,monospace", 15)
+    big = pygame.font.SysFont("consolas,dejavusansmono,monospace", 19, bold=True)
+    clock = pygame.time.Clock()
+
+    uv_per_div = args.uv_per_div
+    running = True
+    while running:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+                elif ev.key == pygame.K_LEFTBRACKET:
+                    uv_per_div = max(5.0, uv_per_div / 1.5)
+                elif ev.key == pygame.K_RIGHTBRACKET:
+                    uv_per_div = min(2000.0, uv_per_div * 1.5)
+                elif ev.key == pygame.K_r:
+                    state.reset_counters()
+
+        if demo is not None:
+            chunk = demo.next_chunk()
+            if chunk is not None:
+                state.push(chunk, args.fs)
+        else:
+            drain(sock, state)
+
+        draw(screen, font, big, state, uv_per_div, args.demo)
+        pygame.display.flip()
+        clock.tick(15)  # hard cap. Dropping frames is correct behaviour.
+
+    pygame.quit()
+    if sock is not None:
+        sock.close()
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
