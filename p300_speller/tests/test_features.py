@@ -106,3 +106,53 @@ def test_epochs_to_matrix_supports_single_channel() -> None:
 def test_epochs_to_matrix_empty_input() -> None:
     cfg = {"downsample_hz": 20, "spatial_filter": "none"}
     assert epochs_to_matrix([], FS, cfg).shape == (0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Realised decimation arithmetic (the documented numbers, pinned to code)
+# --------------------------------------------------------------------------- #
+def test_realised_rate_is_20_83_not_20_hz() -> None:
+    """The requested 20 Hz is not achievable by integer decimation of 250 Hz.
+    round(250/20) = 12 and 250/12 = 20.83 Hz — the rate that must be reported."""
+    factor = max(1, int(round(FS / 20.0)))
+    assert factor == 12
+    assert FS / factor == pytest.approx(20.833, abs=1e-3)
+    # The configured 20.83 yields the same integer factor, so the pipeline
+    # behaviour is unchanged by stating the honest number.
+    assert max(1, int(round(FS / 20.83))) == 12
+
+
+def test_reference_config_yields_54_element_feature_vector() -> None:
+    epoch = _epoch(n_times=225, n_channels=3)         # 0.9 s at 250 Hz
+    feat = epoch_to_features(epoch, FS, downsample_hz=20.83, spatial_filter="none")
+    assert feat.shape == (54,)                        # 18 timepoints x 3 channels
+
+
+def test_decimation_discards_36ms_tail() -> None:
+    """225 samples do not divide by 12: the final 9 samples (36 ms) are
+    dropped, so the feature vector spans to +764 ms, not the configured
+    +800 ms."""
+    n_times, factor = 225, 12
+    usable = (n_times // factor) * factor
+    dropped = n_times - usable
+    assert usable == 216
+    assert dropped == 9
+    assert dropped / FS == pytest.approx(0.036, abs=1e-9)
+
+    out = decimate_epoch(np.arange(n_times * 3, dtype=float).reshape(n_times, 3),
+                         FS, target_hz=20.83)
+    assert out.shape == (18, 3)
+
+    # Coverage of the epoch window, stated explicitly.
+    tmin, tmax = -0.1, 0.8
+    covered_end = tmin + usable / FS
+    assert covered_end == pytest.approx(0.764, abs=1e-9)
+    assert covered_end < tmax
+
+
+def test_decimation_tail_drop_is_visible_in_the_data() -> None:
+    """The dropped tail is genuinely excluded, not folded into the last block."""
+    epoch = np.zeros((225, 1))
+    epoch[216:, 0] = 1000.0            # only the discarded tail is non-zero
+    out = decimate_epoch(epoch, FS, target_hz=20.83)
+    assert np.allclose(out, 0.0)

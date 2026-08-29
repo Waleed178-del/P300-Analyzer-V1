@@ -14,9 +14,11 @@ needs:
   per row and per column across repetitions, and the intersection of the
   best-scoring row and column yields the selected symbol.
 
-The same data path (acquire -> precondition -> epoch -> vectorise) is shared by
-both modes via :meth:`P300Pipeline._collect_epochs`, guaranteeing train/test
-consistency.
+The same data path (acquire -> precondition -> epoch -> reject -> vectorise) is
+shared by both modes via :meth:`P300Pipeline._collect_epochs`, guaranteeing
+train/test consistency. Artifact rejection sits *inside* that shared path, so
+the criterion described in the methodology is the criterion the system actually
+applies, in both calibration and free spelling.
 
 Timing model: the speller and the EEG source share ``time.perf_counter``; the
 pipeline simply pulls the continuous buffer after each character and epochs it
@@ -33,6 +35,7 @@ import numpy as np
 import yaml
 
 from classifier import (
+    DEFAULT_LEAKAGE_GATE_AUC,
     NON_TARGET,
     TARGET,
     P300Classifier,
@@ -41,7 +44,14 @@ from classifier import (
 )
 from acquisition import BaseEEGSource, Simulator, StimulusMarker, build_source
 from features import epochs_to_matrix
-from processing import Epoch, epoch_data, precondition
+from monitor import DEFAULT_PORT as _MONITOR_DEFAULT_PORT, MonitorPublisher
+from processing import (
+    Epoch,
+    RejectionReport,
+    epoch_data,
+    precondition,
+    reject_artifacts_from_config,
+)
 from stimulus import SpellerMatrix
 
 
@@ -49,6 +59,11 @@ def load_config(path: str) -> dict:
     """Load and return the YAML configuration document as a dict."""
     with open(path, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+def monitor_default_port() -> int:
+    """The monitor's own default UDP port, so the two never drift apart."""
+    return int(_MONITOR_DEFAULT_PORT)
 
 
 @dataclass
@@ -91,6 +106,23 @@ class P300Pipeline:
         self.source: BaseEEGSource = source if source is not None else build_source(config)
         self.speller = SpellerMatrix(config)
 
+        # Operator monitor feed (see :mod:`monitor`). Opt-in via the `monitor`
+        # config section; when disabled every publish call is a no-op. The
+        # publisher is fire-and-forget UDP, so a monitor that is absent, slow,
+        # or dead cannot affect the recording.
+        mon_cfg = config.get("monitor") or {}
+        self.monitor = MonitorPublisher(
+            host=mon_cfg.get("host", "127.0.0.1"),
+            port=int(mon_cfg.get("port", monitor_default_port())),
+            enabled=bool(mon_cfg.get("enabled", False)),
+        )
+
+        # Cumulative artifact-rejection tally for the whole session, so the
+        # >30% session-invalidity alarm is evaluated over the session rather
+        # than per character.
+        self.session_epochs_seen = 0
+        self.session_epochs_rejected = 0
+
         # Optional observer invoked with ``(event_type, data_dict)`` at every
         # significant lifecycle point (see :meth:`_emit`). The session manager
         # registers one to drive user prompts and persistent logging. When no
@@ -127,6 +159,16 @@ class P300Pipeline:
             )
         elif event_type == "calibration_complete":
             print(f"[train] calibration complete: {data['report']}")
+        elif event_type == "epochs_rejected":
+            print(f"[quality] {data['report']}")
+        elif event_type == "session_invalid":
+            print(
+                f"[quality] *** SESSION INVALID *** rejection rate "
+                f"{float(data['rejection_rate']):.1%} exceeds the "
+                f"{float(data['max_session_rate']):.0%} limit "
+                f"({data['n_rejected']}/{data['n_total']} epochs). "
+                "Repeat the recording; do not report results from this session."
+            )
 
     # ------------------------------------------------------------------ #
     # Shared data path
@@ -135,20 +177,56 @@ class P300Pipeline:
         """Seconds to wait after the last flash so its epoch is fully buffered."""
         return float(self.epoch_cfg["tmax_s"]) + 0.2
 
-    def _collect_epochs(self, markers: List[StimulusMarker]) -> List[Epoch]:
-        """Acquire, precondition, and epoch the buffer around ``markers``.
+    def _measured_fs(self, timestamps: np.ndarray) -> float:
+        """Sample rate implied by the buffer's own timestamps.
+
+        The monitor flags a measured rate that deviates from nominal by more
+        than 2%, which is how a struggling front-end announces itself. Reporting
+        the configured rate here would defeat that check.
+        """
+        if timestamps.size < 2:
+            return float(self.fs)
+        span = float(timestamps[-1] - timestamps[0])
+        if span <= 0.0:
+            return float(self.fs)
+        return float(timestamps.size - 1) / span
+
+    def _collect_epochs(
+        self,
+        markers: List[StimulusMarker],
+        target_rc: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[List[Epoch], RejectionReport]:
+        """Acquire, precondition, epoch, and artifact-screen around ``markers``.
+
+        Artifact rejection is applied here, in the one path shared by
+        calibration and free spelling, so a contaminated epoch can never reach
+        the classifier through either route.
 
         Args:
             markers: The flash markers recorded for the current character.
+            target_rc: ``(row, col)`` of the cued character during calibration,
+                enabling each epoch to be published to the operator monitor with
+                its true target/non-target label. ``None`` during free spelling,
+                where the label is by definition unknown; the monitor then
+                receives the raw stream only and its ERP panel stays idle rather
+                than accumulating guesses.
 
         Returns:
-            Baseline-corrected epochs aligned to each usable marker.
+            ``(epochs, rejection_report)`` where ``epochs`` are the
+            baseline-corrected epochs that survived the peak-to-peak criterion.
         """
         timestamps, data = self.source.get_buffer()
         if timestamps.size == 0:
-            return []
+            return [], reject_artifacts_from_config([], self.proc_cfg)[1]
+
+        # The monitor receives the RAW buffer, not the conditioned one: the
+        # display applies its own causal filter, and keeping the two paths
+        # independent is what allows the claim that no reported result depends
+        # on the display filter. Their wire format is (n_channels, n_samples).
+        self.monitor.publish_chunk(data.T, self._measured_fs(timestamps))
         conditioned = precondition(data, self.fs, self.proc_cfg)
-        return epoch_data(
+
+        epochs = epoch_data(
             timestamps=timestamps,
             data=conditioned,
             markers=markers,
@@ -160,6 +238,68 @@ class P300Pipeline:
                 self.epoch_cfg["baseline_tmax_s"],
             ),
         )
+
+        # Publish every epoch, including the ones about to be rejected: the
+        # monitor applies the same 100 uV criterion independently to drive its
+        # own rejection-rate readout, so sending only survivors would make that
+        # readout permanently 0%.
+        if target_rc is not None:
+            self._publish_epochs(epochs, target_rc)
+
+        kept, report = reject_artifacts_from_config(epochs, self.proc_cfg)
+        self.session_epochs_seen += report.n_total
+        self.session_epochs_rejected += report.n_rejected
+        if report.n_rejected:
+            self._emit("epochs_rejected", report=report)
+        return kept, report
+
+    def _publish_epochs(
+        self, epochs: List[Epoch], target_rc: Tuple[int, int]
+    ) -> None:
+        """Send labelled epochs to the operator monitor's running ERP panel."""
+        target_row, target_col = target_rc
+        for ep in epochs:
+            label = (
+                TARGET
+                if (
+                    (ep.marker.kind == "row" and ep.marker.index == target_row)
+                    or (ep.marker.kind == "col" and ep.marker.index == target_col)
+                )
+                else NON_TARGET
+            )
+            self.monitor.publish_epoch(ep.data.T, label)
+
+    # ------------------------------------------------------------------ #
+    # Session-level data-quality gate
+    # ------------------------------------------------------------------ #
+    def session_rejection_rate(self) -> float:
+        """Fraction of all epochs rejected so far this session (0.0 if none)."""
+        if self.session_epochs_seen == 0:
+            return 0.0
+        return self.session_epochs_rejected / float(self.session_epochs_seen)
+
+    def _max_session_rejection_rate(self) -> float:
+        ar = self.proc_cfg.get("artifact_rejection") or {}
+        return float(ar.get("max_session_rate", 0.30))
+
+    def _check_session_quality(self) -> bool:
+        """Emit the session-invalidity alarm when too much data was rejected.
+
+        Returns:
+            ``True`` if the session is within the configured rejection budget.
+        """
+        rate = self.session_rejection_rate()
+        limit = self._max_session_rejection_rate()
+        valid = rate <= limit
+        if not valid:
+            self._emit(
+                "session_invalid",
+                rejection_rate=rate,
+                max_session_rate=limit,
+                n_total=self.session_epochs_seen,
+                n_rejected=self.session_epochs_rejected,
+            )
+        return valid
 
     def _set_simulator_target(self, symbol: Optional[str]) -> None:
         """If running on the Simulator, steer its synthetic attention.
@@ -199,6 +339,12 @@ class P300Pipeline:
         words = words if words is not None else self.config["session"]["calibration_words"]
         X_parts: List[np.ndarray] = []
         y_parts: List[np.ndarray] = []
+        group_parts: List[np.ndarray] = []
+        # One group per cued character block. Every epoch collected while the
+        # user attends a single letter shares drift, impedance, and attentional
+        # state, so the block — not the epoch — is the independent unit that
+        # cross-validation must split on.
+        block_index = 0
 
         self.source.start()
         self.speller.open()
@@ -216,6 +362,10 @@ class P300Pipeline:
                     if Xc.size:
                         X_parts.append(Xc)
                         y_parts.append(yc)
+                        group_parts.append(
+                            np.full(Xc.shape[0], block_index, dtype=int)
+                        )
+                        block_index += 1
                         self._emit(
                             "character_trained",
                             symbol=symbol,
@@ -232,6 +382,10 @@ class P300Pipeline:
 
         X = np.vstack(X_parts)
         y = np.concatenate(y_parts)
+        groups = np.concatenate(group_parts)
+
+        # Data-quality gate before any model is fit or saved.
+        self._check_session_quality()
 
         classifier = P300Classifier(
             model_type=self.clf_cfg.get("model_type", "lda"),
@@ -239,12 +393,21 @@ class P300Pipeline:
             svm_c=self.clf_cfg.get("svm_c", 0.1),
             class_weight=self.clf_cfg.get("class_weight", "balanced"),
         )
-        report = classifier.fit(X, y)
+        report = classifier.fit(
+            X,
+            y,
+            groups=groups,
+            cv_folds=int(self.clf_cfg.get("cv_folds", 5)),
+            leakage_gate_auc=float(
+                self.clf_cfg.get("leakage_gate_auc", DEFAULT_LEAKAGE_GATE_AUC)
+            ),
+        )
         classifier.save(self.clf_cfg["model_path"])
         self._emit(
             "calibration_complete",
             report=report,
             model_path=self.clf_cfg["model_path"],
+            rejection_rate=self.session_rejection_rate(),
         )
         return report
 
@@ -261,7 +424,9 @@ class P300Pipeline:
         markers = self.speller.run_character_flashes(self.source, n_sequences)
         time.sleep(self._post_roll_s())
 
-        epochs = self._collect_epochs(markers)
+        epochs, _rejection = self._collect_epochs(
+            markers, target_rc=(target_row, target_col)
+        )
         if not epochs:
             return np.empty((0, 0)), np.empty((0,))
 
@@ -352,7 +517,7 @@ class P300Pipeline:
         markers = self.speller.run_character_flashes(self.source, n_sequences)
         time.sleep(self._post_roll_s())
 
-        epochs = self._collect_epochs(markers)
+        epochs, _rejection = self._collect_epochs(markers)
         if not epochs:
             return None
 

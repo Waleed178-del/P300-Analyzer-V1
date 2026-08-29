@@ -192,6 +192,19 @@ class SessionManager:
                 f"({data['targets']} target)"
             )
 
+        elif event_type == "epochs_rejected":
+            self.logger.log(f"  artifact rejection: {data['report']}")
+
+        elif event_type == "session_invalid":
+            self.logger.log(
+                "*** SESSION INVALID *** artifact rejection rate "
+                f"{float(data['rejection_rate']):.1%} exceeds the "
+                f"{float(data['max_session_rate']):.0%} limit "
+                f"({data['n_rejected']}/{data['n_total']} epochs). "
+                "Repeat the recording; results from this session must not be "
+                "reported."
+            )
+
         elif event_type == "calibration_complete":
             self.logger.log(
                 f"model saved to {data.get('model_path')} | {data['report']}"

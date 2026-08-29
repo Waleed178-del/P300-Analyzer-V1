@@ -17,6 +17,28 @@ representation through three deterministic steps:
 
 The public entry point :func:`epochs_to_matrix` converts a list of epochs into
 a single ``(n_epochs, n_features)`` design matrix ready for scikit-learn.
+
+REALISED DECIMATION ARITHMETIC (reference configuration)
+--------------------------------------------------------
+Decimation is by an **integer** factor, so the requested rate and the realised
+rate are not the same number. For the reference configuration — 250 Hz, an
+epoch of -0.1 s to +0.8 s, three channels — the chain is::
+
+    factor            = round(250 / 20.83)     = 12
+    effective rate    = 250 / 12               = 20.83 Hz   (not 20.0 Hz)
+    samples per epoch = round(0.9 * 250)       = 225
+    usable samples    = (225 // 12) * 12       = 216
+    retained points   = 216 / 12               = 18
+    feature vector    = 18 * 3 channels        = 54 elements
+
+**Tail truncation.** Block averaging consumes whole blocks only, so the final
+``225 - 216 = 9`` samples — **36 ms** — are discarded from the end of every
+epoch. The epoch is configured to +800 ms, but the feature vector therefore
+spans only to **+764 ms**. This is a real limit of integer-factor decimation,
+not an approximation, and it must be stated wherever the epoch window is
+described. It is harmless for the P300 itself (peak near +300 ms, well inside
+the retained span) but it is not invisible: anyone multiplying 18 points by
+48 ms will find it.
 """
 
 from __future__ import annotations
@@ -78,6 +100,12 @@ def decimate_epoch(epoch: np.ndarray, fs: float, target_hz: float) -> np.ndarray
     that energy between retained samples is not discarded and high-frequency
     content is attenuated rather than aliased.
 
+    The factor is an integer, so the realised rate is ``fs / factor`` and not
+    ``target_hz`` in general (250 Hz with a 20.83 Hz target gives factor 12 and
+    a realised 20.83 Hz). Any samples in the incomplete final block are dropped:
+    at 225 samples and factor 12 that is 9 samples, i.e. 36 ms off the end of
+    the epoch. See the module docstring for the full arithmetic.
+
     Args:
         epoch: Array of shape ``(n_times, n_channels)``.
         fs: Original sampling rate in Hz.
@@ -85,7 +113,8 @@ def decimate_epoch(epoch: np.ndarray, fs: float, target_hz: float) -> np.ndarray
             epoch is returned unchanged.
 
     Returns:
-        Array of shape ``(n_times // factor, n_channels)``.
+        Array of shape ``(n_times // factor, n_channels)``. The trailing
+        ``n_times % factor`` samples are discarded.
     """
     factor = max(1, int(round(fs / float(target_hz))))
     if factor == 1:
@@ -140,8 +169,11 @@ def epochs_to_matrix(
     if len(epochs) == 0:
         return np.empty((0, 0), dtype=np.float64)
 
-    downsample_hz = feat_cfg.get("downsample_hz", 20)
-    spatial_filter = feat_cfg.get("spatial_filter", "car")
+    # Default matches configs/config.yaml: the realised rate for factor 12 at
+    # 250 Hz. Both 20 and 20.83 round to factor 12, but the fallback should
+    # state the rate the system actually achieves.
+    downsample_hz = feat_cfg.get("downsample_hz", 20.83)
+    spatial_filter = feat_cfg.get("spatial_filter", "none")
 
     vectors: List[np.ndarray] = [
         epoch_to_features(ep, fs, downsample_hz, spatial_filter) for ep in epochs

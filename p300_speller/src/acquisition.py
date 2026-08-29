@@ -187,9 +187,9 @@ class SerialAcquisition(BaseEEGSource):
         D,<seq>,<micros>,<marker>,<ch0>[,<ch1>,<ch2>]\\n
 
     Raw ADC counts are converted to microvolts using the configured PGA
-    full-scale range. The host applies its own ``perf_counter`` timestamp on
-    packet arrival; the Arduino ``micros`` field is retained only for jitter
-    diagnostics.
+    full-scale range **and the analogue gain of the head-stage**. The host
+    applies its own ``perf_counter`` timestamp on packet arrival; the Arduino
+    ``micros`` field is retained only for jitter diagnostics.
     """
 
     def __init__(
@@ -201,21 +201,47 @@ class SerialAcquisition(BaseEEGSource):
         ring_buffer_s: float,
         adc_fullscale_v: float = 4.096,
         adc_resolution_bits: int = 16,
+        amplifier_gain: float = 949.0,
         read_timeout_s: float = 1.0,
     ) -> None:
+        """Initialise the serial front-end.
+
+        Args:
+            amplifier_gain: Total analogue voltage gain ahead of the ADC, as a
+                pure ratio (INA118P 23.73 x TL072 40 = 949 in the reference
+                build). Counts are divided by this to recover scalp-referred
+                microvolts.
+
+        Raises:
+            RuntimeError: If pyserial is unavailable.
+            ValueError: If ``amplifier_gain`` is not strictly positive.
+        """
         super().__init__(sampling_rate_hz, channel_names, ring_buffer_s)
         if serial is None:
             raise RuntimeError(
                 "pyserial is not installed; install it or set "
                 "acquisition.use_simulator: true in config.yaml"
             )
+        if amplifier_gain <= 0.0:
+            raise ValueError(
+                f"amplifier_gain must be > 0, got {amplifier_gain!r}"
+            )
         self._port = port
         self._baud = baud_rate
         self._read_timeout_s = read_timeout_s
-        # Counts -> microvolts. For a signed 16-bit ADC the positive full scale
-        # is 2**(bits-1) counts mapping to adc_fullscale_v volts.
+        self.amplifier_gain = float(amplifier_gain)
+        # Counts -> microvolts AT THE SCALP. Two divisions are required:
+        #   1. counts -> volts at the ADC input. For a signed 16-bit ADC the
+        #      positive full scale is 2**(bits-1) counts mapping to
+        #      adc_fullscale_v volts (4.096 / 32768 = 125 uV per LSB).
+        #   2. volts at the ADC -> volts at the scalp, by dividing out the
+        #      analogue gain of the head-stage.
+        # Omitting step 2 inflates every reported amplitude by the full gain
+        # (949x in the reference build), which both corrupts every amplitude
+        # figure and silently disables the 100 uV artifact criterion.
         full_scale_counts = float(2 ** (adc_resolution_bits - 1))
-        self._counts_to_uv = (adc_fullscale_v / full_scale_counts) * 1e6
+        volts_per_count = adc_fullscale_v / full_scale_counts
+        self._counts_to_uv = (volts_per_count * 1e6) / self.amplifier_gain
         self._serial: Optional["serial.Serial"] = None
 
     def _open(self) -> "serial.Serial":
@@ -266,7 +292,9 @@ class SerialAcquisition(BaseEEGSource):
         # D, seq, micros, marker, ch0[, ch1, ch2]
         expected = 4 + self.n_channels
         if len(parts) != expected:
-            return None
+            raise ValueError(
+                f"Hardware payload mismatch: Expected {expected} channels, received {len(parts)}."
+            )
         try:
             counts = np.array(
                 [int(parts[4 + c]) for c in range(self.n_channels)],
@@ -457,5 +485,6 @@ def build_source(config: dict) -> BaseEEGSource:
         ring_buffer_s=ring,
         adc_fullscale_v=acq.get("adc_fullscale_v", 4.096),
         adc_resolution_bits=acq.get("adc_resolution_bits", 16),
+        amplifier_gain=acq.get("amplifier_gain", 949.0),
         read_timeout_s=ser.get("read_timeout_s", 1.0),
     )
